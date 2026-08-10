@@ -1,0 +1,10 @@
+# 위키 내용 (개인 데이터)
+pages/
+files/
+config.json
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
