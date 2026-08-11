@@ -8,3 +8,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# 기기별 데이터 폴더 설정
+location.json

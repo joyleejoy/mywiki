@@ -10,14 +10,18 @@ import html
 import http.server
 import json
 import mimetypes
+import os
 import re
 import shutil
+import socket
 import socketserver
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -26,16 +30,89 @@ from markdown.extensions import Extension
 from markdown.inlinepatterns import InlineProcessor
 
 ROOT = Path(__file__).resolve().parent
-PAGES = ROOT / "pages"
-FILES = ROOT / "files"
-CONFIG = ROOT / "config.json"
+LOCATION = ROOT / "location.json"  # 이 기기에서 쓸 데이터 폴더 (기기마다 다르므로 저장소에 올리지 않음)
+DATA = ROOT
+PAGES = DATA / "pages"
+FILES = DATA / "files"
+CONFIG = DATA / "config.json"
 HOME = "홈"
 ORDER_FILE = ".order"
 DEFAULT_NAME = "위키"
+SEARCH_LIMIT = 50
+LIST_LIMIT = 200
 DEFAULT_PORT = 8800
 
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 WIKILINK_RE = r"\[\[([^\[\]]+?)\]\]"
+
+
+# ---------------------------------------------------------------- 데이터 폴더
+# 글과 첨부를 어디에 둘지는 기기마다 고를 수 있습니다. 동기화 폴더를 지정하면
+# 다른 기기와 같은 내용을 보게 됩니다.
+
+def use_data_dir(path: Path) -> None:
+    global DATA, PAGES, FILES, CONFIG
+    DATA = path
+    PAGES = DATA / "pages"
+    FILES = DATA / "files"
+    CONFIG = DATA / "config.json"
+    PAGES.mkdir(parents=True, exist_ok=True)
+    FILES.mkdir(parents=True, exist_ok=True)
+
+
+def saved_data_dir() -> Path:
+    try:
+        raw = json.loads(LOCATION.read_text(encoding="utf-8")).get("data")
+    except (OSError, ValueError):
+        return ROOT
+    return Path(raw) if raw else ROOT
+
+
+def save_data_dir(path: Path) -> None:
+    if path == ROOT:
+        LOCATION.unlink(missing_ok=True)
+        return
+    LOCATION.write_text(
+        json.dumps({"data": str(path)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def move_data_to(target: Path) -> tuple[bool, str]:
+    """데이터 폴더를 옮깁니다. 대상에 이미 위키 내용이 있으면 그것을 그대로 씁니다."""
+    if target == DATA:
+        return True, "이미 그 폴더를 쓰고 있습니다."
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return False, f"폴더를 만들 수 없습니다: {error}"
+    if (target / "pages").is_dir():
+        message = "그 폴더에 있던 내용을 그대로 씁니다."
+    else:
+        try:
+            for name in ("pages", "files", "config.json"):
+                source = DATA / name
+                if source.exists():
+                    shutil.move(str(source), str(target / name))
+        except OSError as error:
+            return False, f"옮기지 못했습니다: {error}"
+        message = "지금 내용을 그 폴더로 옮겼습니다."
+    save_data_dir(target)
+    use_data_dir(target)
+    return True, message
+
+
+def sync_places() -> list[str]:
+    """동기화 폴더로 쓸 만한 곳을 제안합니다."""
+    places = []
+    for key in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+        root = os.environ.get(key)
+        if root and Path(root).is_dir():
+            places.append(str(Path(root) / "wiki"))
+    for name in ("Dropbox", "Google Drive", "GoogleDrive"):
+        folder = Path.home() / name
+        if folder.is_dir():
+            places.append(str(folder / "wiki"))
+    return sorted(set(places))
 
 
 # ---------------------------------------------------------------- 문서 경로
@@ -82,7 +159,7 @@ def resolve_ref(ref: str) -> str:
     ref = normalize_ref(ref)
     if page_exists(ref):
         return ref
-    matches = [name for name, _ in list_pages() if title_of(name) == ref]
+    matches = scan()["titles"].get(ref, [])
     return matches[0] if len(matches) == 1 else ref
 
 
@@ -97,19 +174,76 @@ def write_page(ref: str, text: str) -> None:
     path = page_path(ref)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
+    forget_scan()
 
 
 def delete_page(ref: str) -> None:
     page_path(ref).unlink(missing_ok=True)
+    forget_scan()
 
 
 def list_pages() -> list[tuple[str, datetime]]:
-    items = []
-    for path in PAGES.rglob("*.md"):
-        parts = path.relative_to(PAGES).parts
-        ref = "/".join(parts[:-1] + (path.stem,))
-        items.append((ref, datetime.fromtimestamp(path.stat().st_mtime)))
-    return sorted(items, key=lambda item: item[1], reverse=True)
+    return scan()["pages"]
+
+
+# 폴더를 매번 훑으면 글이 많아질수록 느려지므로, 훑은 결과를 잠깐 담아 둡니다.
+# 우리가 글을 고치면 바로 버리고, 밖에서(탐색기·동기화) 바뀐 것도 CACHE_TTL 안에 반영됩니다.
+CACHE_TTL = 2.0
+_scan_lock = threading.Lock()
+_scan: dict = {"at": 0.0, "root": None}
+
+
+def forget_scan() -> None:
+    _scan["at"] = 0.0
+
+
+def scan() -> dict:
+    with _scan_lock:
+        now = time.monotonic()
+        if _scan["root"] == PAGES and now - _scan["at"] < CACHE_TTL:
+            return _scan
+        pages, folders = [], []
+        names: dict[str, list[tuple[str, bool]]] = {"": []}
+
+        def walk(base: Path, parent: str) -> None:
+            # os.scandir 은 디렉터리 정보를 한 번에 읽어 오므로 파일마다 다시 묻지 않습니다.
+            try:
+                entries = list(os.scandir(base))
+            except OSError:
+                return
+            for entry in entries:
+                if entry.is_dir():
+                    folder = f"{parent}/{entry.name}" if parent else entry.name
+                    folders.append(folder)
+                    names.setdefault(folder, [])
+                    names.setdefault(parent, []).append((entry.name, True))
+                    walk(Path(entry.path), folder)
+                elif entry.name.endswith(".md"):
+                    title = entry.name[:-3]
+                    ref = f"{parent}/{title}" if parent else title
+                    pages.append((ref, datetime.fromtimestamp(entry.stat().st_mtime)))
+                    names.setdefault(parent, []).append((title, False))
+
+        walk(PAGES, "")
+
+        titles: dict[str, list[str]] = {}
+        for ref, _ in pages:
+            titles.setdefault(title_of(ref), []).append(ref)
+
+        children = {}
+        for folder, found in names.items():
+            found.sort(key=lambda item: (not item[1], item[0]))
+            saved = read_order(folder)
+            children[folder] = ([item for item in saved if item in found]
+                                + [item for item in found if item not in saved])
+
+        _scan.update({
+            "at": now, "root": PAGES,
+            "pages": sorted(pages, key=lambda item: item[1], reverse=True),
+            "folders": sorted(folders, key=lambda folder: folder.split("/")),
+            "titles": titles, "children": children,
+        })
+        return _scan
 
 
 def read_order(folder: str) -> list[tuple[str, bool]]:
@@ -131,18 +265,12 @@ def write_order(folder: str, items: list[tuple[str, bool]]) -> None:
     lines = [f"{name}/" if is_folder else name for name, is_folder in items]
     path = folder_path(folder) / ORDER_FILE
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    forget_scan()
 
 
 def children_of(folder: str) -> list[tuple[str, bool]]:
     """폴더 바로 아래의 하위 폴더와 문서를 저장된 순서대로 돌려줍니다."""
-    base = folder_path(folder)
-    if not base.is_dir():
-        return []
-    known = [(path.name, True) for path in sorted(base.iterdir()) if path.is_dir()]
-    known += [(path.stem, False) for path in sorted(base.glob("*.md"))]
-    saved = read_order(folder)
-    ordered = [item for item in saved if item in known]
-    return ordered + [item for item in known if item not in saved]
+    return scan()["children"].get(folder, [])
 
 
 def ordered_refs() -> list[str]:
@@ -162,8 +290,7 @@ def ordered_refs() -> list[str]:
 
 
 def list_folders() -> list[str]:
-    folders = ["/".join(path.relative_to(PAGES).parts) for path in PAGES.rglob("*") if path.is_dir()]
-    return sorted(folders, key=lambda folder: folder.split("/"))
+    return scan()["folders"]
 
 
 def in_folder(ref: str, folder: str) -> bool:
@@ -175,6 +302,7 @@ def create_folder(folder: str) -> tuple[bool, str]:
     if path.exists():
         return False, f"‘{folder}’ 폴더가 이미 있습니다."
     path.mkdir(parents=True)
+    forget_scan()
     return True, f"‘{folder}’ 폴더를 만들었습니다."
 
 
@@ -185,6 +313,7 @@ def rename_folder(folder: str, to: str) -> tuple[bool, str]:
         return False, f"‘{to}’ 폴더가 이미 있습니다. 다른 이름을 써 주세요."
     target.parent.mkdir(parents=True, exist_ok=True)
     source.rename(target)
+    forget_scan()
     return True, f"‘{folder}’ 폴더를 ‘{to}’ 로 옮겼습니다."
 
 
@@ -194,6 +323,7 @@ def delete_folder(folder: str) -> tuple[bool, str]:
     if inside:
         return False, f"‘{folder}’ 안에 문서가 {len(inside)}개 있습니다. 먼저 옮기거나 지워 주세요."
     shutil.rmtree(folder_path(folder))
+    forget_scan()
     return True, f"‘{folder}’ 폴더를 지웠습니다."
 
 
@@ -251,6 +381,7 @@ class WikiLinkProcessor(InlineProcessor):
         ref = resolve_ref(raw)
         element = ElementTree.Element("a")
         element.text = label.strip() or raw.strip()
+        element.set("data-wiki", m.group(1))  # 서식 편집에서 되돌릴 때 씁니다
         if page_exists(ref):
             element.set("href", "/w/" + urllib.parse.quote(ref))
         else:
@@ -272,12 +403,209 @@ MD = markdown.Markdown(
 
 
 MD_LOCK = threading.Lock()
+BLOCK_START = re.compile(r"^\s*(?:[-*+] |\d+[.)] |\|)")
+
+
+def loosen(text: str) -> str:
+    """문단 바로 아래에 붙여 쓴 목록·표·코드블록도 블록으로 인식되도록 빈 줄을 넣습니다."""
+    lines = []
+    fenced = False
+    for line in text.split("\n"):
+        starts_block = BLOCK_START.match(line) or line.lstrip().startswith("```")
+        if not fenced and starts_block and lines and lines[-1].strip():
+            if not BLOCK_START.match(lines[-1]) and not lines[-1].lstrip().startswith("```"):
+                lines.append("")
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def render(text: str) -> str:
     with MD_LOCK:
         MD.reset()
-        return MD.convert(text)
+        return MD.convert(loosen(text))
+
+
+class MarkdownWriter(HTMLParser):
+    """서식 편집 모드에서 고친 화면(HTML)을 다시 마크다운으로 되돌립니다."""
+
+    HEADINGS = {f"h{level}": "#" * level for level in range(1, 7)}
+    SKIP = {"script", "style", "head", "meta", "colgroup", "col"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.line = ""
+        self.lists: list[list] = []          # [마커, 번호] 중첩 목록
+        self.quote = 0
+        self.pre = 0
+        self.skip = 0
+        self.link: list[str] = []            # 링크 여는 태그 정보
+        self.cells: list[str] | None = None  # 표 한 줄
+        self.fence_at: int | None = None     # 코드블록 여는 줄 자리 (언어 이름을 나중에 채움)
+        self.table_head = False
+        self.table_width = 0
+
+    # -- 줄 다루기 ------------------------------------------------------
+    def add(self, text: str) -> None:
+        self.line += text
+
+    def flush(self, blank: bool = False) -> None:
+        text = self.line.rstrip()
+        self.line = ""
+        if text:
+            prefix = "> " * self.quote
+            if self.lists:
+                pad = "    " * (len(self.lists) - 1)
+                marker, number = self.lists[-1]
+                bullet = f"{number}. " if marker == "1" else "- "
+                self.lists[-1][1] = number + 1
+                prefix += pad + bullet
+            self.out.append(prefix + text)
+        elif not blank:
+            return
+        if blank and (not self.out or self.out[-1] != ""):
+            self.out.append("")
+
+    # -- 태그 -----------------------------------------------------------
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.HEADINGS:
+            self.flush(blank=True)
+            self.add(self.HEADINGS[tag] + " ")
+        elif tag in ("p", "div", "tbody", "thead", "table"):
+            if tag == "table":
+                self.table_head = True
+                self.table_width = 0
+            self.flush(blank=tag in ("p", "div", "table"))
+        elif tag == "br":
+            self.flush()
+        elif tag == "hr":
+            self.flush(blank=True)
+            self.out.append("---")
+            self.out.append("")
+        elif tag in ("strong", "b"):
+            self.add("**")
+        elif tag in ("em", "i"):
+            self.add("*")
+        elif tag == "code" and not self.pre:
+            self.add("`")
+        elif tag == "code" and self.fence_at is not None:
+            for name in values.get("class", "").split():
+                if name.startswith("language-"):
+                    self.out[self.fence_at] = "```" + name[len("language-"):]
+            self.fence_at = None
+        elif tag == "pre":
+            self.flush(blank=True)
+            self.fence_at = len(self.out)
+            self.out.append("```")
+            self.pre += 1
+        elif tag in ("ul", "ol"):
+            self.flush()
+            self.lists.append(["1" if tag == "ol" else "-", 1])
+        elif tag == "li":
+            self.flush()
+        elif tag == "blockquote":
+            self.flush(blank=True)
+            self.quote += 1
+        elif tag == "a":
+            wiki = values.get("data-wiki")
+            if wiki is not None:
+                # 위키 링크는 화면에 보이는 글자 대신 원래 적은 내용을 그대로 되살립니다.
+                self.add(f"[[{wiki}]]")
+                self.link.append(None)
+                self.skip += 1
+            else:
+                self.link.append(values.get("href", ""))
+                self.add("[")
+        elif tag == "img":
+            source = values.get("src", "")
+            self.add(f'![{values.get("alt", "")}]({source})')
+        elif tag == "tr":
+            self.cells = []
+        elif tag in ("td", "th"):
+            self.line = ""
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.HEADINGS or tag in ("p", "div"):
+            self.flush(blank=True)
+        elif tag in ("strong", "b"):
+            self.add("**")
+        elif tag in ("em", "i"):
+            self.add("*")
+        elif tag == "code" and not self.pre:
+            self.add("`")
+        elif tag == "pre":
+            self.flush()
+            self.pre = max(0, self.pre - 1)
+            self.out.append("```")
+            self.out.append("")
+        elif tag in ("ul", "ol"):
+            self.flush()
+            if self.lists:
+                self.lists.pop()
+            if not self.lists:
+                self.flush(blank=True)
+        elif tag == "li":
+            self.flush()
+        elif tag == "blockquote":
+            self.flush()
+            self.quote = max(0, self.quote - 1)
+            self.flush(blank=True)
+        elif tag == "a" and self.link:
+            target = self.link.pop()
+            if target is None:
+                self.skip = max(0, self.skip - 1)
+            else:
+                self.add(f"]({target})")
+        elif tag in ("td", "th") and self.cells is not None:
+            self.cells.append(self.line.strip().replace("|", r"\|"))
+            self.line = ""
+        elif tag == "tr" and self.cells is not None:
+            cells = self.cells or [""]
+            self.out.append("| " + " | ".join(cell or " " for cell in cells) + " |")
+            if self.table_head:
+                self.out.append("| " + " | ".join("---" for _ in cells) + " |")
+                self.table_head = False
+            self.cells = None
+        elif tag == "table":
+            self.table_head = False
+            self.out.append("")
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        if self.pre:
+            for index, piece in enumerate(data.split("\n")):
+                if index:
+                    self.flush()
+                self.add(piece)
+            return
+        text = re.sub(r"[ \t]*\n[ \t]*", " ", data.replace("\xa0", " "))
+        if not text.strip() and not self.line:
+            return
+        self.add(text)
+
+    def result(self) -> str:
+        self.flush()
+        lines = self.out
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines) + "\n" if lines else ""
+
+
+def to_markdown(html_text: str) -> str:
+    writer = MarkdownWriter()
+    writer.feed(html_text.replace(" ", " "))
+    writer.close()
+    return writer.result()
 
 
 # ---------------------------------------------------------------- 화면
@@ -296,6 +624,7 @@ CSS = """
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { --head: 61px; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
@@ -343,6 +672,11 @@ aside .acts button {
   font-size: 13px; line-height: 1; padding: 4px 5px; border-radius: 4px;
 }
 aside .acts button:hover { color: var(--accent); background: var(--card); }
+aside .twist {
+  border: none; background: none; color: var(--muted); cursor: pointer;
+  width: 18px; padding: 0; font-size: 11px; flex: none;
+}
+aside .twist:hover { color: var(--accent); }
 aside .none { padding: 8px; font-size: 13px; color: var(--muted); }
 main { flex: 1; min-width: 0; max-width: 900px; margin: 0 auto; padding: 24px; }
 a { color: var(--accent); }
@@ -394,57 +728,88 @@ img { max-width: 100%; border-radius: 6px; }
 .mdbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
 .mdbar .btn { padding: 4px 10px; font-size: 13px; }
 .tabs { display: flex; gap: 6px; margin-bottom: 8px; }
-#preview {
+#rich {
   min-height: 55vh; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px;
   overflow-x: auto;
 }
-#preview > :first-child { margin-top: 0; }
-#preview:empty::before { content: "쓴 내용이 없습니다."; color: var(--muted); }
+#rich:focus { outline: none; border-color: var(--accent); }
+#rich > :first-child { margin-top: 0; }
+#rich:empty::before { content: "여기에 바로 쓰면 됩니다."; color: var(--muted); }
+.mdbar .btn[disabled] { opacity: .4; cursor: default; }
+.modal {
+  position: fixed; inset: 0; z-index: 30; padding: 20px; background: rgba(0, 0, 0, .45);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal .sheet {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  padding: 20px; max-width: 92vw; max-height: 88vh; overflow: auto;
+}
+.modal h2 { margin: 0; border: none; padding: 0; font-size: 18px; }
+#grid { border-collapse: collapse; display: table; margin: 12px 0; }
+#grid td { border: 1px solid var(--line); padding: 0; }
+#grid input {
+  border: none; background: none; color: var(--fg); font: inherit;
+  padding: 7px 10px; width: 150px; border-radius: 0;
+}
+#grid input:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+#grid tr:first-child input { font-weight: 700; background: var(--card); }
 .toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
 .toolbar .spacer { flex: 1; }
 .hint { color: var(--muted); font-size: 13px; }
-input[type=text], input[type=search] {
+input[type=text], input[type=search], select {
   padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
   background: var(--bg); color: var(--fg); font: inherit;
 }
 """
 
 
-def sidebar(current_ref: str = "", current_folder: str = "") -> str:
-    def render(parent: str, depth: int) -> list[str]:
-        rows = []
-        for name, is_folder in children_of(parent):
-            path = f"{parent}/{name}" if parent else name
-            common = (
-                f'<div class="item" draggable="true" '
-                f'data-parent="{html.escape(parent, quote=True)}" '
-                f'data-name="{html.escape(name, quote=True)}" '
+def sidebar_rows(
+    parent: str, depth: int, current_ref: str, current_folder: str, closed: set[str]
+) -> list[str]:
+    rows = []
+    for name, is_folder in children_of(parent):
+        path = f"{parent}/{name}" if parent else name
+        common = (
+            f'<div class="item" draggable="true" '
+            f'data-parent="{html.escape(parent, quote=True)}" '
+            f'data-name="{html.escape(name, quote=True)}" '
+        )
+        indent = 8 + depth * 14
+        if is_folder:
+            state = " on" if path == current_folder else ""
+            folded = path in closed
+            rows.append(
+                f'{common}data-folder="{html.escape(path, quote=True)}">'
+                f'<button class="twist" data-act="fold" style="margin-left:{indent}px" '
+                f'title="접기/펴기">{"▸" if folded else "▾"}</button>'
+                f'<a class="folder{state}" draggable="false" style="padding-left:2px" '
+                f'href="{folder_link(path)}">📁 {html.escape(name)}</a>'
+                '<span class="acts">'
+                '<button data-act="add" title="하위 폴더 추가">＋</button>'
+                '<button data-act="rename" title="폴더 이름·위치 바꾸기">✎</button>'
+                '<button data-act="remove" title="폴더 삭제">✕</button>'
+                "</span></div>"
             )
-            pad = f'style="padding-left:{8 + depth * 14}px"'
-            if is_folder:
-                state = " on" if path == current_folder else ""
-                rows.append(
-                    f'{common}data-folder="{html.escape(path, quote=True)}">'
-                    f'<a class="folder{state}" draggable="false" {pad} '
-                    f'href="{folder_link(path)}">📁 {html.escape(name)}</a>'
-                    '<span class="acts">'
-                    '<button data-act="add" title="하위 폴더 추가">＋</button>'
-                    '<button data-act="rename" title="폴더 이름·위치 바꾸기">✎</button>'
-                    '<button data-act="remove" title="폴더 삭제">✕</button>'
-                    "</span></div>"
-                )
-                rows += render(path, depth + 1)
-            else:
-                state = " on" if path == current_ref else ""
-                rows.append(
-                    f'{common}data-ref="{html.escape(path, quote=True)}" '
-                    f'data-folder="{html.escape(parent, quote=True)}">'
-                    f'<a class="doc{state}" draggable="false" {pad} '
-                    f'href="/w/{urllib.parse.quote(path)}">{html.escape(name)}</a></div>'
-                )
-        return rows
+            if not folded:
+                rows += sidebar_rows(path, depth + 1, current_ref, current_folder, closed)
+        else:
+            state = " on" if path == current_ref else ""
+            rows.append(
+                f'{common}data-ref="{html.escape(path, quote=True)}" '
+                f'data-folder="{html.escape(parent, quote=True)}">'
+                f'<a class="doc{state}" draggable="false" style="padding-left:{indent + 20}px" '
+                f'href="/w/{urllib.parse.quote(path)}">{html.escape(name)}</a></div>'
+            )
+    return rows
 
-    body = "".join(render("", 0)) or '<div class="none">아직 문서가 없습니다.</div>'
+
+def sidebar(current_ref: str = "", current_folder: str = "", closed: set[str] = frozenset()) -> str:
+    # 지금 보고 있는 문서·폴더로 가는 길목은 접혀 있어도 펼쳐서 보여 줍니다.
+    trail = current_folder or folder_of(current_ref)
+    parts = trail.split("/") if trail else []
+    on_path = {"/".join(parts[:depth]) for depth in range(1, len(parts) + 1)}
+    body = "".join(sidebar_rows("", 0, current_ref, current_folder, set(closed) - on_path))
+    body = body or '<div class="none">아직 문서가 없습니다.</div>'
     return (
         '<div class="side-head"><span>문서 목록</span>'
         '<button class="btn" id="side-create" style="padding:2px 8px" '
@@ -512,10 +877,44 @@ aside.onclick = (e) => {
   if (!button) { return; }
   const item = button.closest('.item');
   const act = button.dataset.act;
-  if (act === 'add') { createFolder(item.dataset.folder); }
+  if (act === 'fold') { toggleFolder(item); }
+  else if (act === 'add') { createFolder(item.dataset.folder); }
   else if (act === 'rename') { renameFolder(item.dataset.folder); }
   else if (act === 'remove') { removeFolder(item.dataset.folder); }
 };
+
+// 접어 둔 폴더는 서버가 아예 그리지 않습니다. 글이 많아져도 목록이 가볍게 유지됩니다.
+function closedFolders() {
+  const found = document.cookie.split(';').find((c) => c.trim().startsWith('closed='));
+  const raw = found ? found.trim().slice('closed='.length) : '';
+  return new Set(raw.split('|').filter(Boolean).map(decodeURIComponent));
+}
+
+function saveClosed(folders) {
+  const value = [...folders].map(encodeURIComponent).join('|');
+  document.cookie = 'closed=' + value + ';path=/;max-age=31536000;samesite=lax';
+}
+
+async function toggleFolder(item) {
+  const folder = item.dataset.folder;
+  const folders = closedFolders();
+  const twist = item.querySelector('.twist');
+  if (folders.has(folder)) {
+    folders.delete(folder);
+    saveClosed(folders);
+    const res = await fetch('/tree?folder=' + encodeURIComponent(folder));
+    item.insertAdjacentHTML('afterend', await res.text());
+    twist.textContent = '▾';
+  } else {
+    folders.add(folder);
+    saveClosed(folders);
+    for (const el of [...aside.querySelectorAll('.item')]) {
+      const parent = el.dataset.parent;
+      if (parent === folder || parent.startsWith(folder + '/')) { el.remove(); }
+    }
+    twist.textContent = '▸';
+  }
+}
 
 // 끌어다 놓기: 폴더 가운데에 놓으면 그 안으로, 줄의 위아래 가장자리에 놓으면 그 자리로
 // 순서가 바뀝니다. 목록 빈 곳에 놓으면 맨 바깥 맨 뒤로 나옵니다.
@@ -628,7 +1027,7 @@ aside.addEventListener('drop', async (e) => {
 
 def shell(
     title: str, body: str, script: str = "", query: str = "",
-    current_ref: str = "", current_folder: str = "",
+    current_ref: str = "", current_folder: str = "", closed: set[str] = frozenset(),
 ) -> bytes:
     page = f"""<!doctype html>
 <html lang="ko"><head>
@@ -654,7 +1053,7 @@ if (localStorage.getItem('sidebar') === 'off') {{
   <a class="btn" href="/settings" title="위키 이름 바꾸기">⚙</a>
 </header>
 <div class="layout">
-  <aside>{sidebar(current_ref, current_folder)}</aside>
+  <aside>{sidebar(current_ref, current_folder, closed)}</aside>
   <main>{body}</main>
 </div>
 <script>{COMMON_SCRIPT}{LAYOUT_SCRIPT}{script}</script>
@@ -711,9 +1110,49 @@ def grouped_rows(pages: list[tuple[str, datetime]]) -> str:
     return "".join(blocks)
 
 
-def index_body(folder: str) -> str:
+SORTS = [
+    ("order", "내가 정한 순서"),
+    ("recent", "최근에 고친 순"),
+    ("old", "오래전에 고친 순"),
+    ("name", "이름 순"),
+]
+
+
+def sorted_pages(folder: str, sort: str) -> list[tuple[str, datetime]]:
     changed = dict(list_pages())
-    pages = [(ref, changed[ref]) for ref in ordered_refs() if in_folder(ref, folder)]
+    if sort == "recent":
+        pages = sorted(changed.items(), key=lambda item: item[1], reverse=True)
+    elif sort == "old":
+        pages = sorted(changed.items(), key=lambda item: item[1])
+    elif sort == "name":
+        pages = sorted(changed.items(), key=lambda item: title_of(item[0]))
+    else:
+        pages = [(ref, changed[ref]) for ref in ordered_refs()]
+    return [item for item in pages if in_folder(item[0], folder)]
+
+
+def page_links(params: dict, page: int, total: int, size: int) -> str:
+    """결과가 많을 때 아래쪽에 붙는 이전·다음 단추."""
+    last = max(1, (total + size - 1) // size)
+    if last <= 1:
+        return ""
+
+    def link(to: int, label: str) -> str:
+        if to < 1 or to > last:
+            return f'<span class="btn" style="opacity:.4">{label}</span>'
+        query = urllib.parse.urlencode({**params, "page": to}, doseq=True)
+        return f'<a class="btn" href="?{query}">{label}</a>'
+
+    first = (page - 1) * size + 1
+    return (
+        f'<div class="toolbar">{link(page - 1, "← 이전")}'
+        f'<span class="meta">{first}–{min(page * size, total)} / {total}개 '
+        f"({page}/{last} 쪽)</span>{link(page + 1, '다음 →')}</div>"
+    )
+
+
+def index_body(folder: str, sort: str = "order", page: int = 1) -> str:
+    pages = sorted_pages(folder, sort)
     quoted = urllib.parse.quote(folder)
     heading = (
         f'<h1>📁 {html.escape(folder)} <span class="meta">({len(pages)}개)</span></h1>' if folder
@@ -734,12 +1173,33 @@ def index_body(folder: str) -> str:
             f'<p class="empty">아직 문서가 없습니다. <a href="{target}">글을 써 보세요.</a></p>'
         )
     else:
-        listing = grouped_rows(pages)
-    return f"{crumbs(folder) if folder else ''}{heading}{toolbar}{listing}"
+        page = max(1, min(page, (len(pages) + LIST_LIMIT - 1) // LIST_LIMIT))
+        shown = pages[(page - 1) * LIST_LIMIT:page * LIST_LIMIT]
+        params = {"folder": folder, "sort": sort} if folder else {"sort": sort}
+        listing = grouped_rows(shown) + page_links(params, page, len(pages), LIST_LIMIT)
+    choices = "".join(
+        f'<option value="{key}"{" selected" if key == sort else ""}>{label}</option>'
+        for key, label in SORTS
+    )
+    picker = (
+        f'<div class="toolbar"><label class="meta" for="sort">정렬</label>'
+        f'<select id="sort" data-folder="{html.escape(folder, quote=True)}">{choices}</select>'
+        "</div>"
+    )
+    return f"{crumbs(folder) if folder else ''}{heading}{toolbar}{picker}{listing}"
 
 
 INDEX_SCRIPT = """
 const openFolder = document.getElementById('folder-tools').dataset.folder;
+const sortPicker = document.getElementById('sort');
+if (sortPicker) {
+  sortPicker.onchange = () => {
+    const params = new URLSearchParams();
+    if (openFolder) { params.set('folder', openFolder); }
+    params.set('sort', sortPicker.value);
+    location.href = '/?' + params;
+  };
+}
 document.getElementById('create').onclick = () => createFolder(openFolder);
 const renameButton = document.getElementById('rename');
 if (renameButton) {
@@ -749,7 +1209,7 @@ if (renameButton) {
 """
 
 
-def search_body(query: str) -> str:
+def search_body(query: str, page: int = 1) -> str:
     if not query:
         return '<h1>검색</h1><p class="empty">위쪽 검색창에 찾을 말을 넣어 주세요.</p>'
     found = search_pages(query)
@@ -759,7 +1219,12 @@ def search_body(query: str) -> str:
             f'{head}<p class="empty">찾은 문서가 없습니다. '
             f'<a href="/new">이 내용으로 새 글을 써 보세요.</a></p>'
         )
-    return head + entry_rows(found, query, show_folder=True)
+    page = max(1, min(page, (len(found) + SEARCH_LIMIT - 1) // SEARCH_LIMIT))
+    shown = found[(page - 1) * SEARCH_LIMIT:page * SEARCH_LIMIT]
+    return (
+        head + entry_rows(shown, query, show_folder=True)
+        + page_links({"q": query}, page, len(found), SEARCH_LIMIT)
+    )
 
 
 def view_body(ref: str) -> str:
@@ -800,14 +1265,15 @@ if (pageTools) {
 
 
 MD_BUTTONS = [
-    ("제목", 'data-prefix="## "'),
-    ("굵게", 'data-wrap="**" data-hint="굵은 글씨"'),
-    ("기울임", 'data-wrap="*" data-hint="기울인 글씨"'),
+    ("제목", 'data-prefix="## " data-rich="formatBlock:h2"'),
+    ("굵게", 'data-wrap="**" data-hint="굵은 글씨" data-rich="bold"'),
+    ("기울임", 'data-wrap="*" data-hint="기울인 글씨" data-rich="italic"'),
     ("코드", 'data-wrap="`" data-hint="코드"'),
-    ("목록", 'data-prefix="- "'),
-    ("인용", 'data-prefix="&gt; "'),
+    ("목록", 'data-prefix="- " data-rich="insertUnorderedList"'),
+    ("인용", 'data-prefix="&gt; " data-rich="formatBlock:blockquote"'),
     ("링크", 'data-snippet="[보일 글자](https://)"'),
     ("문서 링크", 'data-snippet="[[문서 이름]]"'),
+    ("표", 'data-table="1" data-rich="table"'),
 ]
 
 EDITOR_SCRIPT = """
@@ -840,6 +1306,7 @@ async function save(leave) {
   const name = titleInput.value.trim();
   if (!name) { status.textContent = '제목을 입력해 주세요.'; titleInput.focus(); return; }
   status.textContent = '저장 중...';
+  if (richMode && !await pullFromRich()) { return; }
   const res = await fetch('/save', {
     method: 'POST', headers: {'Content-Type': 'application/json; charset=utf-8'},
     body: JSON.stringify({
@@ -864,7 +1331,15 @@ async function upload(files) {
     });
     if (!res.ok) { status.textContent = '업로드 실패'; return; }
     const saved = await res.json();
-    typeText(saved.markdown + '\\n');
+    if (richMode) {
+      rich.focus();
+      const link = '/f/' + encodeURIComponent(saved.name);
+      document.execCommand('insertHTML', false, saved.markdown.startsWith('!')
+        ? '<img src="' + link + '" alt="' + saved.name + '">'
+        : '<a href="' + link + '">' + saved.name + '</a>');
+    } else {
+      typeText(saved.markdown + '\\n');
+    }
     status.textContent = saved.name + ' 첨부됨 (저장을 눌러야 반영됩니다)';
   }
 }
@@ -875,33 +1350,137 @@ document.getElementById('picker').onchange = (e) => upload(e.target.files);
 document.querySelectorAll('.mdbar button').forEach((button) => {
   button.onclick = () => {
     const data = button.dataset;
+    if (richMode) {
+      const [command, value] = data.rich.split(':');
+      if (command === 'table') { openTable(); }
+      else { rich.focus(); document.execCommand(command, false, value); }
+      return;
+    }
     if (data.wrap) { wrapSelection(data.wrap, data.hint); }
     else if (data.prefix) { prefixLine(data.prefix); }
+    else if (data.table) { openTable(); }
     else { typeText(data.snippet); }
   };
 });
 
-const tabText = document.getElementById('tab-text');
-const tabView = document.getElementById('tab-view');
-const preview = document.getElementById('preview');
-const mdbar = document.querySelector('.mdbar');
+// 표 만들기: 격자에 바로 입력하고 넣으면 마크다운 표로 들어갑니다.
+const tableModal = document.getElementById('table-modal');
+const grid = document.getElementById('grid');
+let gridRows = 3;
+let gridCols = 3;
 
-async function setMode(viewing) {
-  if (viewing) {
+function readGrid() {
+  return [...grid.rows].map((row) => [...row.cells].map((cell) => cell.firstChild.value));
+}
+
+function drawGrid() {
+  const kept = grid.rows.length ? readGrid() : [];
+  grid.innerHTML = '';
+  for (let r = 0; r < gridRows; r++) {
+    const row = grid.insertRow();
+    for (let c = 0; c < gridCols; c++) {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = (kept[r] && kept[r][c]) || '';
+      input.placeholder = r === 0 ? '제목' : '';
+      row.insertCell().appendChild(input);
+    }
+  }
+}
+
+function openTable() {
+  gridRows = 3;
+  gridCols = 3;
+  grid.innerHTML = '';
+  drawGrid();
+  tableModal.hidden = false;
+  grid.rows[0].cells[0].firstChild.focus();
+}
+
+function closeTable() {
+  tableModal.hidden = true;
+  (richMode ? rich : editor).focus();
+}
+
+function tableMarkdown() {
+  const data = readGrid().map((row) => row.map((v) => v.trim().replace(/\\|/g, '\\\\|') || ' '));
+  const lines = ['| ' + data[0].join(' | ') + ' |',
+                 '| ' + data[0].map(() => '---').join(' | ') + ' |'];
+  for (const row of data.slice(1)) { lines.push('| ' + row.join(' | ') + ' |'); }
+  return lines.join('\\n') + '\\n';
+}
+
+document.querySelectorAll('[data-grid]').forEach((button) => {
+  button.onclick = () => {
+    const act = button.dataset.grid;
+    if (act === 'row+') { gridRows++; }
+    else if (act === 'row-') { gridRows = Math.max(1, gridRows - 1); }
+    else if (act === 'col+') { gridCols++; }
+    else { gridCols = Math.max(1, gridCols - 1); }
+    drawGrid();
+  };
+});
+
+function tableHtml() {
+  const data = readGrid();
+  const cell = (v) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;') || '&nbsp;';
+  const head = data[0].map((v) => '<th>' + cell(v) + '</th>').join('');
+  const body = data.slice(1)
+    .map((row) => '<tr>' + row.map((v) => '<td>' + cell(v) + '</td>').join('') + '</tr>')
+    .join('');
+  return '<table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table><p><br></p>';
+}
+
+document.getElementById('table-insert').onclick = () => {
+  const markdown = tableMarkdown();
+  const asHtml = tableHtml();
+  closeTable();
+  if (richMode) { rich.focus(); document.execCommand('insertHTML', false, asHtml); }
+  else { typeText(markdown); }
+};
+document.getElementById('table-cancel').onclick = closeTable;
+tableModal.onclick = (e) => { if (e.target === tableModal) { closeTable(); } };
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !tableModal.hidden) { closeTable(); }
+});
+
+// 두 가지 편집 모드: 마크다운 원본을 그대로 고치거나, 꾸며진 화면에서 바로 고칩니다.
+const tabText = document.getElementById('tab-text');
+const tabRich = document.getElementById('tab-rich');
+const rich = document.getElementById('rich');
+const mdbar = document.querySelector('.mdbar');
+let richMode = false;
+
+async function pullFromRich() {
+  const done = await post('/tomarkdown', {html: rich.innerHTML});
+  if (!done) { return false; }
+  editor.value = done.text;
+  return true;
+}
+
+async function setMode(toRich) {
+  if (toRich === richMode) { return; }
+  if (toRich) {
     const shown = await post('/preview', {text: editor.value});
     if (!shown) { return; }
-    preview.innerHTML = shown.html;
+    rich.innerHTML = shown.html;
+  } else if (!await pullFromRich()) {
+    return;
   }
-  editor.hidden = viewing;
-  mdbar.hidden = viewing;
-  preview.hidden = !viewing;
-  tabText.classList.toggle('primary', !viewing);
-  tabView.classList.toggle('primary', viewing);
-  if (!viewing) { editor.focus(); }
+  richMode = toRich;
+  editor.hidden = toRich;
+  rich.hidden = !toRich;
+  tabText.classList.toggle('primary', !toRich);
+  tabRich.classList.toggle('primary', toRich);
+  for (const button of document.querySelectorAll('.mdbar button')) {
+    button.disabled = toRich && !button.dataset.rich;
+  }
+  (toRich ? rich : editor).focus();
 }
 
 tabText.onclick = () => setMode(false);
-tabView.onclick = () => setMode(true);
+tabRich.onclick = () => setMode(true);
+document.execCommand('styleWithCSS', false, false);
 
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save(false); }
@@ -911,16 +1490,68 @@ for (const box of [titleInput, folderInput]) {
     if (e.key === 'Enter') { e.preventDefault(); editor.focus(); }
   });
 }
-editor.addEventListener('paste', (e) => {
-  const files = [...e.clipboardData.files];
-  if (files.length) { e.preventDefault(); upload(files); }
+
+// 마크다운 모드에서 Tab 은 들여쓰기, Enter 는 목록·인용을 이어 줍니다.
+const INDENT = '    ';
+
+function lineHere() {
+  const start = editor.value.lastIndexOf('\\n', editor.selectionStart - 1) + 1;
+  return {start: start, text: editor.value.slice(start, editor.selectionStart)};
+}
+
+function eraseBack(count) {
+  editor.setSelectionRange(editor.selectionStart - count, editor.selectionStart);
+  document.execCommand('delete');
+}
+
+editor.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    if (!e.shiftKey) { typeText(INDENT); return; }
+    const here = lineHere();
+    const spaces = here.text.match(/^ {1,4}/);
+    if (spaces) {
+      const at = editor.selectionStart;
+      editor.setSelectionRange(here.start, here.start + spaces[0].length);
+      document.execCommand('delete');
+      editor.setSelectionRange(at - spaces[0].length, at - spaces[0].length);
+    }
+    return;
+  }
+  if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey) { return; }
+  const found = lineHere().text.match(/^(\s*)([-*+] |\d+[.)] |> )(.*)$/);
+  if (!found) { return; }
+  e.preventDefault();
+  if (!found[3].trim()) {
+    eraseBack(found[1].length + found[2].length);  // 빈 항목이면 목록을 끝냅니다
+    typeText('\\n');
+    return;
+  }
+  const numbered = found[2].match(/^(\\d+)([.)] )$/);
+  const marker = numbered ? (Number(numbered[1]) + 1) + numbered[2] : found[2];
+  typeText('\\n' + found[1] + marker);
 });
-editor.addEventListener('dragover', (e) => { e.preventDefault(); editor.classList.add('drag'); });
-editor.addEventListener('dragleave', () => editor.classList.remove('drag'));
-editor.addEventListener('drop', (e) => {
-  e.preventDefault(); editor.classList.remove('drag');
-  if (e.dataTransfer.files.length) upload(e.dataTransfer.files);
+
+// 서식 편집 모드에서는 Tab 으로 목록 단계를 조절합니다.
+rich.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    document.execCommand(e.shiftKey ? 'outdent' : 'indent');
+  }
 });
+for (const box of [editor, rich]) {
+  box.addEventListener('paste', (e) => {
+    const files = [...e.clipboardData.files];
+    if (files.length) { e.preventDefault(); upload(files); }
+  });
+  box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('drag'); });
+  box.addEventListener('dragleave', () => box.classList.remove('drag'));
+  box.addEventListener('drop', (e) => {
+    e.preventDefault();
+    box.classList.remove('drag');
+    if (e.dataTransfer.files.length) { upload(e.dataTransfer.files); }
+  });
+}
 (titleInput.value ? editor : titleInput).focus();
 """
 
@@ -941,21 +1572,38 @@ def edit_body(ref: str, folder: str = "") -> str:
         f'value="{html.escape(title, quote=True)}" maxlength="100">'
         "</div>"
         '<div class="tabs">'
-        '<button class="btn primary" id="tab-text">텍스트</button>'
-        '<button class="btn" id="tab-view">미리보기</button>'
+        '<button class="btn primary" id="tab-text">마크다운</button>'
+        '<button class="btn" id="tab-rich">서식 편집</button>'
         "</div>"
         f'<div class="mdbar">{buttons}</div>'
         f'<textarea id="editor" data-original="{html.escape(ref if exists else "", quote=True)}" '
         f'placeholder="본문을 마크다운으로 씁니다." spellcheck="false">'
         f"{html.escape(read_page(ref))}</textarea>"
-        '<div id="preview" hidden></div>'
+        '<div id="rich" contenteditable="true" spellcheck="false" hidden></div>'
+        '<div class="modal" id="table-modal" hidden><div class="sheet">'
+        "<h2>표 만들기</h2>"
+        '<p class="hint">첫 줄은 제목 칸입니다. <code>Tab</code> 으로 다음 칸으로 넘어갑니다.</p>'
+        '<table id="grid"></table>'
+        '<div class="toolbar">'
+        '<button class="btn" data-grid="row+">행 추가</button>'
+        '<button class="btn" data-grid="row-">행 삭제</button>'
+        '<button class="btn" data-grid="col+">열 추가</button>'
+        '<button class="btn" data-grid="col-">열 삭제</button>'
+        '<span class="spacer"></span>'
+        '<button class="btn primary" id="table-insert">넣기</button>'
+        '<button class="btn" id="table-cancel">취소</button>'
+        "</div></div></div>"
         '<div class="toolbar">'
         '<button class="btn primary" id="done">게시</button>'
         '<button class="btn" id="save">저장 (Ctrl+S)</button>'
         '<label class="btn">파일 첨부<input type="file" id="picker" multiple hidden></label>'
         f'<a class="btn" href="{cancel_href}">취소</a>'
         '<span id="status" class="meta"></span></div>'
-        '<p class="hint">폴더는 <code>개발/서버</code> 처럼 <code>/</code> 로 여러 단계를 씁니다. '
+        '<p class="hint"><b>마크다운</b> 은 원본을 그대로 고치는 모드, <b>서식 편집</b> 은 '
+        '꾸며진 화면에서 바로 고치는 모드입니다. 두 모드는 오갈 때마다 서로 옮겨 적히고, '
+        '저장되는 파일은 언제나 마크다운입니다. '
+        '<code>[[문서 링크]]</code> 와 인라인 <code>코드</code> 는 마크다운 모드에서 넣어 주세요.<br>'
+        '폴더는 <code>개발/서버</code> 처럼 <code>/</code> 로 여러 단계를 씁니다. '
         '비워 두면 폴더 없이 저장됩니다. 문서 링크는 <code>[[문서 이름]]</code> 또는 '
         '<code>[[폴더/문서 이름]]</code>. 이미지·파일은 드래그해서 놓거나 클립보드에서 '
         '바로 붙여넣을 수 있습니다. 제목이나 폴더를 바꿔 저장하면 문서가 그대로 옮겨집니다.</p>'
@@ -963,27 +1611,55 @@ def edit_body(ref: str, folder: str = "") -> str:
 
 
 SETTINGS_SCRIPT = """
+const settingsStatus = document.getElementById('status');
+
 document.getElementById('save').onclick = async () => {
-  const status = document.getElementById('status');
-  const res = await fetch('/settings', {
-    method: 'POST', headers: {'Content-Type': 'application/json; charset=utf-8'},
-    body: JSON.stringify({name: document.getElementById('name').value}),
-  });
-  if (res.ok) { location.href = '/settings'; }
-  else { status.textContent = await res.text(); }
+  if (await post('/settings', {name: document.getElementById('name').value})) {
+    location.href = '/settings';
+  }
+};
+
+document.getElementById('save-data').onclick = async () => {
+  const path = document.getElementById('data').value.trim();
+  const question = path
+    ? '글과 첨부를 다음 폴더에서 씁니다.\\n\\n' + path
+      + '\\n\\n그 폴더에 이미 위키 내용이 있으면 그것을 그대로 쓰고, 없으면 지금 내용을 옮깁니다.'
+    : '글과 첨부를 프로그램 옆(기본 위치)으로 되돌립니다. 계속할까요?';
+  if (!confirm(question)) { return; }
+  settingsStatus.textContent = '옮기는 중...';
+  const done = await post('/settings/data', {path: path});
+  if (done) { alert(done.message); location.href = '/settings'; }
+  else { settingsStatus.textContent = ''; }
 };
 """
 
 
 def settings_body() -> str:
+    places = "".join(f'<option value="{html.escape(p, quote=True)}">' for p in sync_places())
+    synced = DATA != ROOT
     return (
         "<h1>설정</h1>"
-        '<p class="hint">위키 이름입니다. 화면 왼쪽 위와 브라우저 탭에 표시됩니다.</p>'
+        "<h2>위키 이름</h2>"
+        '<p class="hint">화면 왼쪽 위와 브라우저 탭에 표시됩니다.</p>'
         f'<p><input type="text" id="name" maxlength="40" style="width:320px" '
         f'value="{html.escape(wiki_name(), quote=True)}"></p>'
-        '<div class="toolbar"><button class="btn primary" id="save">저장</button>'
-        '<a class="btn" href="/">문서 목록으로</a>'
+        '<div class="toolbar"><button class="btn primary" id="save">이름 저장</button>'
         '<span id="status" class="meta"></span></div>'
+        "<h2>데이터 폴더</h2>"
+        '<p class="hint">글과 첨부가 저장되는 곳입니다. OneDrive 같은 동기화 폴더를 지정하면 '
+        '다른 기기에서도 같은 내용을 보고 고칠 수 있습니다. 비워 두면 프로그램 옆에 저장합니다.</p>'
+        f'<p class="meta">지금 위치: <code>{html.escape(str(DATA))}</code>'
+        f'{" (동기화 폴더)" if synced else " (프로그램 옆, 이 기기에만 있음)"}</p>'
+        f'<p><input type="text" id="data" list="places" style="width:min(560px,100%)" '
+        f'placeholder="비우면 프로그램 옆에 저장합니다" '
+        f'value="{html.escape(str(DATA) if synced else "", quote=True)}">'
+        f'<datalist id="places">{places}</datalist></p>'
+        '<div class="toolbar"><button class="btn" id="save-data">데이터 폴더 바꾸기</button>'
+        '<a class="btn" href="/">문서 목록으로</a></div>'
+        '<p class="hint">지정한 폴더에 이미 위키 내용이 있으면 <b>그 내용을 그대로</b> 씁니다. '
+        '없으면 <b>지금 내용을 그 폴더로 옮깁니다</b>. 다른 기기에서는 같은 동기화 폴더를 '
+        '지정하기만 하면 됩니다. 두 기기에서 같은 글을 동시에 고치면 동기화 프로그램이 '
+        '충돌 사본을 만들 수 있으니, 한 번에 한 곳에서 쓰는 편이 좋습니다.</p>'
     )
 
 
@@ -1016,6 +1692,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rest = urllib.parse.unquote(parts[2]) if len(parts) > 2 else ""
         return prefix, rest, urllib.parse.parse_qs(parsed.query)
 
+    def page_number(self, query: dict) -> int:
+        try:
+            return max(1, int(query.get("page", ["1"])[0]))
+        except ValueError:
+            return 1
+
+    def closed_folders(self) -> set[str]:
+        """접어 둔 폴더 목록. 브라우저가 쿠키로 알려 줍니다."""
+        raw = ""
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == "closed":
+                raw = value
+        return {urllib.parse.unquote(name) for name in raw.split("|") if name}
+
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length).decode("utf-8"))
@@ -1023,20 +1714,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         prefix, rest, query = self.split_path()
         name = wiki_name()
+        closed = self.closed_folders()
 
         if prefix == "":
             folder = normalize_ref(query.get("folder", [""])[0])
+            sort = query.get("sort", ["order"])[0]
+            sort = sort if sort in dict(SORTS) else "order"
+            page = self.page_number(query)
             self.send(shell(
-                f"문서 목록 - {name}", index_body(folder), INDEX_SCRIPT, current_folder=folder,
+                f"문서 목록 - {name}", index_body(folder, sort, page), INDEX_SCRIPT,
+                current_folder=folder, closed=closed,
             ))
         elif prefix == "new":
             folder = normalize_ref(query.get("folder", [""])[0])
-            self.send(shell(f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT))
+            self.send(shell(f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT, closed=closed))
         elif prefix == "search":
             keyword = query.get("q", [""])[0].strip()
-            self.send(shell(f"검색 - {name}", search_body(keyword), query=keyword))
+            self.send(shell(
+                f"검색 - {name}", search_body(keyword, self.page_number(query)),
+                query=keyword, closed=closed,
+            ))
         elif prefix == "settings":
-            self.send(shell(f"설정 - {name}", settings_body(), SETTINGS_SCRIPT))
+            self.send(shell(f"설정 - {name}", settings_body(), SETTINGS_SCRIPT, closed=closed))
+        elif prefix == "tree":
+            folder = normalize_ref(query.get("folder", [""])[0])
+            rows = sidebar_rows(folder, folder.count("/") + 1, "", "", closed - {folder})
+            self.send("".join(rows).encode("utf-8"))
         elif prefix in ("w", "e"):
             ref = normalize_ref(rest)
             if not is_valid_ref(ref):
@@ -1044,11 +1747,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif prefix == "w":
                 ref = resolve_ref(ref)
                 self.send(shell(
-                    f"{title_of(ref)} - {name}", view_body(ref), VIEW_SCRIPT, current_ref=ref,
+                    f"{title_of(ref)} - {name}", view_body(ref), VIEW_SCRIPT,
+                    current_ref=ref, closed=closed,
                 ))
             else:
                 self.send(shell(
-                    f"{title_of(ref)} 편집", edit_body(ref), EDITOR_SCRIPT, current_ref=ref,
+                    f"{title_of(ref)} 편집", edit_body(ref), EDITOR_SCRIPT,
+                    current_ref=ref, closed=closed,
                 ))
         elif prefix == "f":
             self.serve_file(rest)
@@ -1068,8 +1773,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.save_order()
         elif prefix == "preview":
             self.send_json({"html": render(self.read_json().get("text", ""))})
+        elif prefix == "tomarkdown":
+            self.send_json({"text": to_markdown(self.read_json().get("html", ""))})
         elif prefix == "folder":
             self.change_folder(rest)
+        elif prefix == "settings" and rest == "data":
+            self.change_data_dir()
         elif prefix == "settings":
             name = self.read_json().get("name", "").strip()
             if not name:
@@ -1128,6 +1837,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         delete_page(ref)
         self.send_json({"folder": folder_of(ref)})
+
+    def change_data_dir(self):
+        raw = self.read_json().get("path", "").strip()
+        target = Path(raw).expanduser() if raw else ROOT
+        if raw and not target.is_absolute():
+            self.send_text(400, "폴더는 전체 경로로 적어 주세요. 예: C:\\Users\\나\\OneDrive\\wiki")
+            return
+        moved, message = move_data_to(target)
+        if moved:
+            self.send_json({"data": str(DATA), "message": message})
+        else:
+            self.send_text(400, message)
 
     def save_order(self):
         data = self.read_json()
@@ -1197,22 +1918,52 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+class Server6(Server):
+    # localhost 는 ::1(IPv6)로 먼저 풀리는 일이 많습니다. 한쪽만 듣고 있으면 브라우저가
+    # 실패한 뒤 다시 붙느라 요청마다 몇 초씩 버리므로, 양쪽을 모두 듣습니다.
+    address_family = socket.AF_INET6
+
+
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
-    PAGES.mkdir(exist_ok=True)
-    FILES.mkdir(exist_ok=True)
+    # pythonw 처럼 콘솔 없이 띄우면 출력 통로가 없어 로그를 쓰다가 죽습니다.
+    if sys.stdout is None or sys.stderr is None:
+        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+    args = sys.argv[1:]
+    data = ""
+    if "--data" in args:
+        at = args.index("--data")
+        data = args[at + 1] if at + 1 < len(args) else ""
+        del args[at:at + 2]
+    port = int(args[0]) if args else DEFAULT_PORT
+
+    use_data_dir(Path(data).expanduser() if data else saved_data_dir())
     if not page_exists(HOME):
         write_page(HOME, WELCOME)
 
     url = f"http://localhost:{port}/"
-    print(f"위키 저장 위치: {ROOT}")
+    print(f"위키 저장 위치: {DATA}")
     print(f"주소: {url}   (종료: Ctrl+C)")
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
-    with Server(("127.0.0.1", port), Handler) as httpd:
+
+    servers = []
+    for host, kind in (("127.0.0.1", Server), ("::1", Server6)):
         try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n종료합니다.")
+            servers.append(kind((host, port), Handler))
+        except OSError as error:
+            print(f"{host} 는 듣지 못합니다: {error}")
+    if not servers:
+        raise SystemExit(f"{port} 포트를 열 수 없습니다.")
+
+    for httpd in servers[1:]:
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        servers[0].serve_forever()
+    except KeyboardInterrupt:
+        print("\n종료합니다.")
+    finally:
+        for httpd in servers:
+            httpd.shutdown()
 
 
 WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편집 버튼으로 자유롭게 고칠 수 있습니다.
@@ -1241,8 +1992,10 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
 - 편집 화면에 이미지나 파일을 드래그해서 놓거나, 스크린샷을 그대로 붙여넣으면
   `files/` 폴더에 저장되고 본문에 링크가 삽입됩니다.
 - 오른쪽 위 검색창에서 제목과 본문을 함께 찾습니다.
-- 위키 이름은 오른쪽 위 ⚙ 에서 바꿉니다.
-- 편집 화면 위쪽의 **텍스트 / 미리보기** 로 원본과 꾸며진 결과를 오가며 볼 수 있습니다.
+- 위키 이름과 **데이터 폴더**는 오른쪽 위 ⚙ 에서 바꿉니다. 데이터 폴더를 OneDrive 같은
+  동기화 폴더로 지정하면 다른 기기에서도 같은 내용을 보고 고칠 수 있습니다.
+- 편집 화면 위쪽에서 **마크다운**(원본을 그대로 고치기)과 **서식 편집**(꾸며진 화면에서
+  바로 고치기) 두 모드를 오갈 수 있습니다. 어느 쪽에서 고쳐도 파일은 마크다운으로 저장됩니다.
 - `Ctrl+S` 로 저장합니다.
 
 ## 시작하기
