@@ -29,7 +29,8 @@ import markdown
 from markdown.extensions import Extension
 from markdown.inlinepatterns import InlineProcessor
 
-ROOT = Path(__file__).resolve().parent
+# exe 로 묶여 돌 때는 파일이 임시 폴더에 풀리므로, 글은 exe 가 놓인 자리에서 찾습니다.
+ROOT = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOCATION = ROOT / "location.json"  # 이 기기에서 쓸 데이터 폴더 (기기마다 다르므로 저장소에 올리지 않음)
 DATA = ROOT
 PAGES = DATA / "pages"
@@ -797,9 +798,9 @@ aside .acts button {
 aside .acts button:hover { color: var(--accent); background: var(--card); }
 aside .twist {
   border: none; background: none; color: var(--muted); cursor: pointer;
-  width: 18px; padding: 0; font-size: 11px; flex: none;
+  width: 20px; padding: 6px 0; font-size: 12px; flex: none; border-radius: 4px;
 }
-aside .twist:hover { color: var(--accent); }
+aside .twist:hover { color: var(--accent); background: var(--card); }
 aside .none { padding: 8px; font-size: 13px; color: var(--muted); }
 main { flex: 1; min-width: 0; max-width: 900px; margin: 0 auto; padding: 24px; }
 a { color: var(--accent); }
@@ -827,7 +828,15 @@ img { max-width: 100%; border-radius: 6px; }
 .crumbs { font-size: 14px; margin-bottom: 10px; }
 .crumbs a { text-decoration: none; }
 .group { margin-top: 26px; }
-.group h2 { font-size: 15px; color: var(--muted); border: none; padding: 0; margin: 0; }
+.group h2 {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 15px; color: var(--muted); border: none; padding: 0; margin: 0;
+}
+.group h2 .twist {
+  border: none; background: none; color: var(--muted); cursor: pointer;
+  font-size: 13px; padding: 6px 8px; border-radius: 4px;
+}
+.group h2 .twist:hover { color: var(--accent); background: var(--card); }
 .list { list-style: none; padding: 0; margin: 6px 0 0; }
 .list li { padding: 12px 4px; border-bottom: 1px solid var(--line); }
 .list .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1388,11 +1397,13 @@ def grouped_rows(pages: list[tuple[str, datetime]]) -> str:
     blocks = []
     for folder in groups:
         label = f"📁 {html.escape(folder)}" if folder else "폴더 없음"
-        heading = (
-            f'<h2><a href="{folder_link(folder)}">{label}</a></h2>' if folder
-            else f"<h2>{label}</h2>"
+        name = f'<a href="{folder_link(folder)}">{label}</a>' if folder else label
+        blocks.append(
+            f'<div class="group" data-folder="{html.escape(folder, quote=True)}">'
+            f'<h2><button class="twist" data-fold="1" title="접기/펴기">▾</button>'
+            f'{name} <span class="meta">{len(groups[folder])}개</span></h2>'
+            f"{entry_rows(groups[folder])}</div>"
         )
-        blocks.append(f'<div class="group">{heading}{entry_rows(groups[folder])}</div>')
     return "".join(blocks)
 
 
@@ -1483,7 +1494,33 @@ def index_body(folder: str, sort: str = "order", page: int = 1) -> str:
 
 
 LIST_SCRIPT = """
+// 문서 목록에서도 폴더 묶음을 접었다 펼 수 있습니다. 접은 것은 다음에도 그대로입니다.
+function foldedGroups() {
+  try { return new Set(JSON.parse(localStorage.getItem('foldedGroups') || '[]')); }
+  catch (e) { return new Set(); }
+}
+
+function paintGroup(group, folded) {
+  group.querySelector('ul').hidden = folded;
+  group.querySelector('.twist').textContent = folded ? '▸' : '▾';
+}
+
+const startFolded = foldedGroups();
+for (const group of document.querySelectorAll('.group[data-folder]')) {
+  if (startFolded.has(group.dataset.folder)) { paintGroup(group, true); }
+}
+
 document.querySelector('main').addEventListener('click', (e) => {
+  const twist = e.target.closest('button[data-fold]');
+  if (twist) {
+    const group = twist.closest('.group');
+    const folded = foldedGroups();
+    const shut = !folded.has(group.dataset.folder);
+    if (shut) { folded.add(group.dataset.folder); } else { folded.delete(group.dataset.folder); }
+    localStorage.setItem('foldedGroups', JSON.stringify([...folded]));
+    paintGroup(group, shut);
+    return;
+  }
   const button = e.target.closest('button[data-row]');
   if (!button) { return; }
   const row = button.closest('li');
@@ -1728,7 +1765,7 @@ const folderInput = document.getElementById('folder');
 const status = document.getElementById('status');
 const mdbar = document.getElementById('mdbar');
 const rich = document.getElementById('rich');
-let richMode = false;
+let richMode = true;   // 꾸며진 화면에서 바로 고치는 쪽을 기본으로 씁니다
 let original = editor.dataset.original;
 
 function typeText(text) {
@@ -2347,6 +2384,9 @@ async function setMode(toRich) {
 tabText.onclick = () => setMode(false);
 tabRich.onclick = () => setMode(true);
 document.execCommand('styleWithCSS', false, false);
+for (const button of mdbar.querySelectorAll('button')) {
+  button.disabled = richMode && !button.dataset.rich;   // 처음 열릴 때 상태를 맞춥니다
+}
 
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save(false); }
@@ -2418,7 +2458,7 @@ for (const box of [editor, rich]) {
     if (e.dataTransfer.files.length) { upload(e.dataTransfer.files); }
   });
 }
-(titleInput.value ? editor : titleInput).focus();
+(titleInput.value ? (richMode ? rich : editor) : titleInput).focus();
 """
 
 
@@ -2501,14 +2541,15 @@ def edit_body(ref: str, folder: str = "") -> str:
         f'value="{html.escape(title, quote=True)}" maxlength="100">'
         "</div>"
         '<div class="tabs">'
-        '<button class="btn primary" id="tab-text">마크다운</button>'
-        '<button class="btn" id="tab-rich">서식 편집</button>'
+        '<button class="btn" id="tab-text">마크다운</button>'
+        '<button class="btn primary" id="tab-rich">서식 편집</button>'
         "</div>"
         f'<div class="mdbar" id="mdbar">{buttons}</div>'
         f'<textarea id="editor" data-original="{html.escape(ref if exists else "", quote=True)}" '
-        f'placeholder="본문을 마크다운으로 씁니다." spellcheck="false">'
+        f'placeholder="본문을 마크다운으로 씁니다." spellcheck="false" hidden>'
         f"{html.escape(read_page(ref))}</textarea>"
-        '<div id="rich" contenteditable="true" spellcheck="false" hidden></div>'
+        '<div id="rich" contenteditable="true" spellcheck="false">'
+        f"{render(read_page(ref), highlight=False)}</div>"
         '<div class="modal" id="table-modal" hidden><div class="sheet">'
         "<h2>표 만들기</h2>"
         '<p class="hint">첫 줄은 제목 칸입니다. <code>Tab</code> 으로 다음 칸으로 넘어갑니다.</p>'
@@ -2940,16 +2981,44 @@ def main():
     if not servers:
         raise SystemExit(f"{port} 포트를 열 수 없습니다.")
 
-    for httpd in servers[1:]:
+    for httpd in servers:
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
-        servers[0].serve_forever()
+        run_tray(url)
     except KeyboardInterrupt:
         print("\n종료합니다.")
     finally:
         for httpd in servers:
             httpd.shutdown()
+
+
+def run_tray(url: str) -> None:
+    """트레이(작업 표시줄 오른쪽 아래)에 아이콘을 띄웁니다. 없으면 그냥 계속 돕니다."""
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except ImportError:
+        threading.Event().wait()   # 트레이를 못 쓰면 Ctrl+C 로 끕니다
+        return
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    pen = ImageDraw.Draw(image)
+    pen.rounded_rectangle((6, 8, 58, 56), radius=8, fill=(9, 105, 218))
+    pen.rectangle((30, 8, 34, 56), fill=(255, 255, 255))
+    for line in range(3):
+        pen.rectangle((12, 18 + line * 10, 27, 21 + line * 10), fill=(255, 255, 255))
+        pen.rectangle((37, 18 + line * 10, 52, 21 + line * 10), fill=(255, 255, 255))
+
+    icon = pystray.Icon(
+        "wiki", image, f"{wiki_name()} — {url}",
+        menu=pystray.Menu(
+            pystray.MenuItem("위키 열기", lambda: webbrowser.open(url), default=True),
+            pystray.MenuItem("저장 폴더 열기", lambda: os.startfile(DATA)),
+            pystray.MenuItem("끝내기", lambda tray: tray.stop()),
+        ),
+    )
+    icon.run()
 
 
 WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편집 버튼으로 자유롭게 고칠 수 있습니다.

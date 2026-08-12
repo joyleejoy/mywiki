@@ -11,3 +11,9 @@ venv/
 
 # 기기별 데이터 폴더 설정
 location.json
+
+# exe 빌드 결과
+build/
+dist/
+*.spec
+*.exe
