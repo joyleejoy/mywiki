@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import socketserver
 import sys
 import threading
@@ -28,6 +29,7 @@ from xml.etree import ElementTree
 import markdown
 from markdown.extensions import Extension
 from markdown.inlinepatterns import InlineProcessor
+from markdown.treeprocessors import Treeprocessor
 
 # exe 로 묶여 돌 때는 파일이 임시 폴더에 풀리므로, 글은 exe 가 놓인 자리에서 찾습니다.
 ROOT = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
@@ -101,6 +103,71 @@ def move_data_to(target: Path) -> tuple[bool, str]:
     save_data_dir(target)
     use_data_dir(target)
     return True, message
+
+
+# ---------------------------------------------------------------- 내 PC 파일 열기
+
+EDITORS = [
+    ("auto", "켜져 있는 것으로 (자동)"),
+    ("vscode", "Visual Studio Code"),
+    ("vs", "Visual Studio"),
+    ("system", "윈도우 기본 프로그램"),
+]
+QUIET = {"creationflags": 0x08000000} if os.name == "nt" else {}   # 검은 창 없이 실행
+
+
+def is_running(image: str) -> bool:
+    try:
+        found = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
+            capture_output=True, text=True, timeout=5, **QUIET,
+        )
+        return image.lower() in found.stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def devenv_path() -> str:
+    """설치된 Visual Studio 실행 파일을 찾습니다."""
+    found = shutil.which("devenv")
+    if found:
+        return found
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    vswhere = vswhere / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return ""
+    try:
+        asked = subprocess.run(
+            [str(vswhere), "-latest", "-property", "productPath"],
+            capture_output=True, text=True, timeout=10, **QUIET,
+        )
+        return asked.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def open_local(path: str, line: int, choice: str) -> tuple[bool, str]:
+    """내 PC 파일을 엽니다. 줄 번호가 있으면 코드 편집기의 그 줄로 갑니다."""
+    target = Path(path)
+    if not target.exists():
+        return False, f"그 자리에 없습니다: {path}"
+    if not line or target.is_dir():
+        os.startfile(str(target))
+        return True, f"{target.name} 을(를) 열었습니다."
+
+    if choice == "auto":
+        choice = "vs" if is_running("devenv.exe") else "vscode"
+    if choice == "vscode" and shutil.which("code"):
+        subprocess.Popen(["cmd", "/c", "code", "-g", f"{target}:{line}"], **QUIET)
+        return True, f"VS Code 에서 {target.name}:{line} 을(를) 열었습니다."
+    if choice == "vs":
+        devenv = devenv_path()
+        if devenv:
+            subprocess.Popen(
+                [devenv, "/edit", str(target), "/command", f"Edit.Goto {line}"], **QUIET)
+            return True, f"Visual Studio 에서 {target.name}:{line} 을(를) 열었습니다."
+    os.startfile(str(target))
+    return True, f"{target.name} 을(를) 기본 프로그램으로 열었습니다. (줄 이동은 못 했습니다)"
 
 
 def sync_places() -> list[str]:
@@ -471,10 +538,29 @@ class NoteProcessor(InlineProcessor):
         return element, m.start(0), m.end(0)
 
 
+LOCAL_PATH = re.compile(r"^(?:file:///)?([A-Za-z]:[\\/].*?)(?::(\d+))?$")
+
+
+class LocalLinkProcessor(Treeprocessor):
+    """내 PC 경로로 건 링크는 눌렀을 때 서버가 열어 주도록 표시해 둡니다."""
+
+    def run(self, root):
+        for link in root.iter("a"):
+            found = LOCAL_PATH.match(urllib.parse.unquote(link.get("href", "")))
+            if not found:
+                continue
+            link.set("data-path", found.group(1).replace("/", "\\"))
+            if found.group(2):
+                link.set("data-line", found.group(2))
+            link.set("class", (link.get("class", "") + " local").strip())
+            link.set("href", "#")
+
+
 class WikiLinkExtension(Extension):
     def extendMarkdown(self, md):
         md.inlinePatterns.register(WikiLinkProcessor(WIKILINK_RE, md), "wikilink", 170)
         md.inlinePatterns.register(NoteProcessor(NOTE_RE, md), "wikinote", 171)
+        md.treeprocessors.register(LocalLinkProcessor(md), "locallink", 5)
 
 
 try:  # 코드에 색을 입히는 데 씁니다. 없으면 색 없이 그대로 보여 줍니다.
@@ -805,6 +891,9 @@ aside .none { padding: 8px; font-size: 13px; color: var(--muted); }
 main { flex: 1; min-width: 0; max-width: 900px; margin: 0 auto; padding: 24px; }
 a { color: var(--accent); }
 a.new { color: var(--new); border-bottom: 1px dashed var(--new); text-decoration: none; }
+a.local { text-decoration: none; border-bottom: 1px dotted var(--accent); }
+a.local::before { content: "📄 "; font-size: .9em; }
+a.local[data-line]::before { content: "</> "; font-family: Consolas, monospace; font-size: .85em; }
 mark { background: var(--mark); color: inherit; border-radius: 3px; }
 h1, h2, h3 { line-height: 1.3; margin-top: 1.6em; }
 h1 { margin-top: 0; padding-bottom: .3em; border-bottom: 1px solid var(--line); }
@@ -1101,6 +1190,15 @@ async function removePage(ref) {
   if (!confirm('‘' + ref + '’ 글을 지울까요? 되돌릴 수 없습니다.')) { return; }
   if (await post('/delete', {ref: ref})) { location.reload(); }
 }
+
+// 내 PC 파일 링크는 브라우저가 직접 열지 못하므로 위키 서버에 부탁합니다.
+document.addEventListener('click', async (e) => {
+  const link = e.target.closest('a.local');
+  if (!link) { return; }
+  e.preventDefault();
+  const done = await post('/open', {path: link.dataset.path, line: link.dataset.line || 0});
+  if (done && window.status !== undefined) { console.log(done.message); }
+});
 """
 
 LAYOUT_SCRIPT = """
@@ -1738,6 +1836,7 @@ MD_BUTTONS = [
     ("목록", 'data-prefix="- " data-rich="insertUnorderedList"'),
     ("인용", 'data-prefix="&gt; " data-rich="formatBlock:blockquote"'),
     ("링크", 'data-snippet="[보일 글자](https://)"'),
+    ("내 PC 파일", 'data-local="1" data-rich="local"'),
     ("문서 링크", 'data-snippet="[[문서 이름]]"'),
     ("표", 'data-table="1" data-rich="table"'),
     ("그림", 'data-draw="1" data-rich="draw"'),
@@ -1860,6 +1959,26 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !linkModal.hidden) { closeLinkModal(); }
 });
 
+// 내 PC 파일이나 코드 위치로 가는 링크를 넣습니다.
+function insertLocalLink() {
+  const chosen = richMode ? String(document.getSelection()).trim()
+    : editor.value.slice(editor.selectionStart, editor.selectionEnd).trim();
+  const typed = prompt(
+    '파일 경로를 붙여 넣어 주세요. 줄 번호까지 가려면 뒤에 :줄번호 를 붙입니다.\\n'
+    + '예) E:\\\\P4V\\\\GServer\\\\GCore\\\\Foo.cs:123', chosen);
+  if (!typed) { return; }
+  const path = typed.trim();
+  const label = (chosen && chosen !== path) ? chosen : path.split(/[\\\\/]/).pop();
+  const url = 'file:///' + encodeURI(path.replace(/\\\\/g, '/'));
+  if (richMode) {
+    rich.focus();
+    document.execCommand('insertHTML', false,
+      '<a href="' + url + '">' + label.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</a>');
+  } else {
+    typeText('[' + label + '](' + url + ')');
+  }
+}
+
 // 고른 영역을 코드 블록으로 감쌉니다. 종류를 고르면 그 문법에 맞춰 색이 입혀집니다.
 function insertCodeBlock(toRich) {
   const lang = document.getElementById('code-lang').value;
@@ -1932,6 +2051,7 @@ mdbar.querySelectorAll('button').forEach((button) => {
       else if (command === 'draw') { openDraw(null); }
       else if (command === 'code') { insertCodeBlock(true); }
       else if (command === 'extract') { extractToPage(); }
+      else if (command === 'local') { insertLocalLink(); }
       else { rich.focus(); document.execCommand(command, false, value); }
       return;
     }
@@ -1941,6 +2061,7 @@ mdbar.querySelectorAll('button').forEach((button) => {
     else if (data.draw) { openDraw(null); }
     else if (data.code) { insertCodeBlock(false); }
     else if (data.extract) { extractToPage(); }
+    else if (data.local) { insertLocalLink(); }
     else { typeText(data.snippet); }
   };
 });
@@ -2588,6 +2709,7 @@ document.getElementById('save').onclick = async () => {
   const done = await post('/settings', {
     name: document.getElementById('name').value,
     home: document.getElementById('home').value,
+    editor: document.getElementById('editor').value,
   });
   if (done) { location.href = '/settings'; }
 };
@@ -2613,6 +2735,11 @@ def settings_body() -> str:
     pages = "".join(
         f'<option value="{html.escape(ref, quote=True)}">' for ref, _ in sorted(list_pages())
     )
+    chosen = read_config().get("editor", "auto")
+    editors = "".join(
+        f'<option value="{key}"{" selected" if key == chosen else ""}>{label}</option>'
+        for key, label in EDITORS
+    )
     return (
         "<h1>설정</h1>"
         "<h2>위키 이름</h2>"
@@ -2625,6 +2752,10 @@ def settings_body() -> str:
         f'<p><input type="text" id="home" list="pagelist" style="width:min(420px,100%)" '
         f'placeholder="예: 가이드" value="{html.escape(read_config().get("home", ""), quote=True)}">'
         f'<datalist id="pagelist">{pages}</datalist></p>'
+        "<h2>코드 편집기</h2>"
+        '<p class="hint">글에 넣은 코드 위치 링크(<code>파일:줄</code>)를 눌렀을 때 무엇으로 열지 '
+        "정합니다. 자동은 Visual Studio 가 켜져 있으면 그쪽, 아니면 VS Code 를 씁니다.</p>"
+        f'<p><select id="editor">{editors}</select></p>'
         '<div class="toolbar"><button class="btn primary" id="save">저장</button>'
         '<span id="status" class="meta"></span></div>'
         "<h2>데이터 폴더</h2>"
@@ -2761,6 +2892,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.move_page()
         elif prefix == "delete":
             self.remove_page()
+        elif prefix == "open":
+            # 다른 사이트가 몰래 파일을 실행시키지 못하도록 요청이 이 위키에서 왔는지 봅니다.
+            origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
+            if origin and not re.match(r"^https?://(localhost|127\.0\.0\.1|\[::1\])[:/]", origin):
+                self.send_text(403, "이 위키에서 온 요청이 아닙니다.")
+                return
+            data = self.read_json()
+            try:
+                line = int(data.get("line") or 0)
+            except ValueError:
+                line = 0
+            self.reply(open_local(data.get("path", ""), line, read_config().get("editor", "auto")),
+                       data.get("path", ""))
         elif prefix == "note":
             data = self.read_json()
             ref = normalize_ref(data.get("ref", ""))
@@ -2794,7 +2938,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif home and not page_exists(home):
                 self.send_text(400, f"‘{home}’ 글이 없습니다. 있는 글 이름을 넣어 주세요.")
             else:
-                write_config({"name": name[:40], "home": home})
+                editor = data.get("editor", "auto")
+                write_config({
+                    "name": name[:40], "home": home,
+                    "editor": editor if editor in dict(EDITORS) else "auto",
+                })
                 self.send_json({"name": wiki_name(), "home": home})
         elif prefix == "upload":
             self.save_upload()
