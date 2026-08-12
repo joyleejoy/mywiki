@@ -182,6 +182,20 @@ def delete_page(ref: str) -> None:
     forget_scan()
 
 
+def move_children(old_ref: str, new_ref: str) -> bool:
+    """글 아래에 달린 글들을 새 자리로 함께 옮깁니다."""
+    kids = folder_path(old_ref)
+    if not kids.is_dir():
+        return True
+    target = folder_path(new_ref)
+    if target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    kids.rename(target)
+    forget_scan()
+    return True
+
+
 def list_pages() -> list[tuple[str, datetime]]:
     return scan()["pages"]
 
@@ -232,6 +246,9 @@ def scan() -> dict:
 
         children = {}
         for folder, found in names.items():
+            # 글과 같은 이름의 폴더는 그 글의 자식들을 담는 곳이므로 따로 세지 않습니다.
+            here = {name for name, is_folder in found if not is_folder}
+            found = [item for item in found if not (item[1] and item[0] in here)]
             found.sort(key=lambda item: (not item[1], item[0]))
             saved = read_order(folder)
             children[folder] = ([item for item in saved if item in found]
@@ -273,6 +290,10 @@ def children_of(folder: str) -> list[tuple[str, bool]]:
     return scan()["children"].get(folder, [])
 
 
+def has_children(ref: str) -> bool:
+    return bool(children_of(ref))
+
+
 def ordered_refs() -> list[str]:
     """모든 문서를 저장된 표시 순서대로 나열합니다."""
     refs = []
@@ -280,10 +301,9 @@ def ordered_refs() -> list[str]:
     def walk(folder: str) -> None:
         for name, is_folder in children_of(folder):
             path = f"{folder}/{name}" if folder else name
-            if is_folder:
-                walk(path)
-            else:
+            if not is_folder:
                 refs.append(path)
+            walk(path)   # 글 아래에 달린 글도 이어서 봅니다
 
     walk("")
     return refs
@@ -341,17 +361,28 @@ def store_upload(filename: str, data: bytes, replace: bool = False) -> str:
     return target.name
 
 
-def wiki_name() -> str:
+def read_config() -> dict:
     try:
-        return json.loads(CONFIG.read_text(encoding="utf-8")).get("name") or DEFAULT_NAME
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return DEFAULT_NAME
+        return {}
 
 
-def set_wiki_name(name: str) -> None:
+def write_config(values: dict) -> None:
     CONFIG.write_text(
-        json.dumps({"name": name}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps({**read_config(), **values}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
+
+
+def wiki_name() -> str:
+    return read_config().get("name") or DEFAULT_NAME
+
+
+def home_page() -> str:
+    """위키 이름을 눌렀을 때 열 글. 정해 두지 않았으면 문서 목록으로 갑니다."""
+    home = normalize_ref(read_config().get("home", ""))
+    return home if page_exists(home) else ""
 
 
 def search_pages(query: str) -> list[tuple[str, datetime, list[str]]]:
@@ -682,6 +713,7 @@ aside .side-head {
 }
 aside .side-acts { display: flex; align-items: center; gap: 6px; flex: none; }
 aside .side-acts .btn { padding: 2px 8px; font-size: 12px; line-height: 1.6; }
+#side-sort { padding: 2px 6px; font-size: 12px; max-width: 108px; }
 aside .item { display: flex; align-items: center; border-radius: 6px; cursor: grab; }
 aside .item.dragging { opacity: .4; }
 aside .item.drop > a { outline: 2px dashed var(--accent); outline-offset: -2px; }
@@ -821,11 +853,30 @@ input[type=text], input[type=search], select {
 """
 
 
+def side_children(parent: str, sort: str) -> list[tuple[str, bool]]:
+    """왼쪽 목록에 보일 순서. 폴더는 늘 위에 두고 글만 고른 기준으로 세웁니다."""
+    items = children_of(parent)
+    if sort == "order":
+        return items
+    folders = sorted((item for item in items if item[1]), key=lambda item: item[0].casefold())
+    pages = [item for item in items if not item[1]]
+    if sort == "name":
+        pages.sort(key=lambda item: item[0].casefold())
+    else:
+        changed = dict(list_pages())
+        pages.sort(
+            key=lambda item: changed.get(f"{parent}/{item[0]}" if parent else item[0]),
+            reverse=(sort == "recent"),
+        )
+    return folders + pages
+
+
 def sidebar_rows(
-    parent: str, depth: int, current_ref: str, current_folder: str, closed: set[str]
+    parent: str, depth: int, current_ref: str, current_folder: str, closed: set[str],
+    sort: str = "order",
 ) -> list[str]:
     rows = []
-    for name, is_folder in children_of(parent):
+    for name, is_folder in side_children(parent, sort):
         path = f"{parent}/{name}" if parent else name
         common = (
             f'<div class="item" draggable="true" '
@@ -850,35 +901,54 @@ def sidebar_rows(
                 "</span></div>"
             )
             if not folded:
-                rows += sidebar_rows(path, depth + 1, current_ref, current_folder, closed)
+                rows += sidebar_rows(path, depth + 1, current_ref, current_folder, closed, sort)
         else:
             state = " on" if path == current_ref else ""
+            nested = has_children(path)
+            folded = path in closed
+            twist = (
+                f'<button class="twist" data-act="fold" style="margin-left:{indent}px" '
+                f'title="접기/펴기">{"▸" if folded else "▾"}</button>'
+                if nested else f'<span class="twist" style="margin-left:{indent}px"></span>'
+            )
             rows.append(
                 f'{common}data-ref="{html.escape(path, quote=True)}" '
-                f'data-folder="{html.escape(parent, quote=True)}">'
-                f'<a class="doc{state}" draggable="false" style="padding-left:{indent + 20}px" '
+                f'data-folder="{html.escape(parent, quote=True)}">{twist}'
+                f'<a class="doc{state}" draggable="false" style="padding-left:2px" '
                 f'href="/w/{urllib.parse.quote(path)}">{html.escape(name)}</a>'
                 '<span class="acts">'
-                '<button data-act="edit" title="글 고치기">✎</button>'
+                '<button data-act="under" title="이 글 아래에 새 글">📄</button>'
+                '<button data-act="edit" title="글 제목 바꾸기">✎</button>'
                 '<button data-act="erase" title="글 삭제">✕</button>'
                 "</span></div>"
             )
+            if nested and not folded:
+                rows += sidebar_rows(path, depth + 1, current_ref, current_folder, closed, sort)
     return rows
 
 
-def sidebar(current_ref: str = "", current_folder: str = "", closed: set[str] = frozenset()) -> str:
+def sidebar(
+    current_ref: str = "", current_folder: str = "", closed: set[str] = frozenset(),
+    sort: str = "order",
+) -> str:
     # 지금 보고 있는 문서·폴더로 가는 길목은 접혀 있어도 펼쳐서 보여 줍니다.
     trail = current_folder or folder_of(current_ref)
     parts = trail.split("/") if trail else []
     on_path = {"/".join(parts[:depth]) for depth in range(1, len(parts) + 1)}
-    body = "".join(sidebar_rows("", 0, current_ref, current_folder, set(closed) - on_path))
+    body = "".join(sidebar_rows("", 0, current_ref, current_folder, set(closed) - on_path, sort))
     body = body or '<div class="none">아직 문서가 없습니다.</div>'
+    choices = "".join(
+        f'<option value="{key}"{" selected" if key == sort else ""}>{label}</option>'
+        for key, label in SORTS
+    )
     return (
-        '<div class="side-head"><span>문서 목록</span>'
+        '<div class="side-head">'
         '<span class="side-acts">'
         '<a class="btn" href="/new" title="새 글 쓰기">＋ 글</a>'
         '<button class="btn" id="side-create" title="새 폴더 만들기">＋ 폴더</button>'
-        "</span></div>" + body
+        "</span>"
+        f'<select id="side-sort" title="목록 정렬">{choices}</select>'
+        "</div>" + body
     )
 
 
@@ -969,6 +1039,10 @@ grip.addEventListener('pointerdown', (e) => {
 const aside = document.querySelector('aside');
 
 document.getElementById('side-create').onclick = () => createFolder('');
+document.getElementById('side-sort').onchange = (e) => {
+  document.cookie = 'sideSort=' + e.target.value + ';path=/;max-age=31536000;samesite=lax';
+  location.reload();
+};
 aside.onclick = (e) => {
   const button = e.target.closest('button[data-act]');
   if (!button) { return; }
@@ -979,6 +1053,7 @@ aside.onclick = (e) => {
   else if (act === 'rename') { renameFolder(item.dataset.folder); }
   else if (act === 'remove') { removeFolder(item.dataset.folder); }
   else if (act === 'write') { location.href = '/new?folder=' + encodeURIComponent(item.dataset.folder); }
+  else if (act === 'under') { location.href = '/new?folder=' + encodeURIComponent(item.dataset.ref); }
   else if (act === 'edit') { renamePage(item.dataset.ref, item.dataset.name); }
   else if (act === 'erase') { removePage(item.dataset.ref); }
 };
@@ -996,7 +1071,7 @@ function saveClosed(folders) {
 }
 
 async function toggleFolder(item) {
-  const folder = item.dataset.folder;
+  const folder = item.dataset.ref || item.dataset.folder;   // 글 아래 글도 접고 폅니다
   const folders = closedFolders();
   const twist = item.querySelector('.twist');
   if (folders.has(folder)) {
@@ -1030,7 +1105,8 @@ function dropSpot(e) {
   if (!item || item === dragged) { return {mode: 'root'}; }
   const box = item.getBoundingClientRect();
   const offset = (e.clientY - box.top) / box.height;
-  if (!item.dataset.ref && offset > 0.25 && offset < 0.75) { return {mode: 'inside', item: item}; }
+  // 줄 한가운데에 놓으면 그 폴더 안으로, 글이면 그 글 아래로 들어갑니다.
+  if (offset > 0.3 && offset < 0.7) { return {mode: 'inside', item: item}; }
   return {mode: offset < 0.5 ? 'before' : 'after', item: item};
 }
 
@@ -1108,7 +1184,7 @@ aside.addEventListener('drop', async (e) => {
   clearDrop();
   if (!item) { return; }
 
-  const parent = spot.mode === 'inside' ? spot.item.dataset.folder
+  const parent = spot.mode === 'inside' ? (spot.item.dataset.ref || spot.item.dataset.folder)
                : spot.mode === 'root' ? '' : spot.item.dataset.parent;
   const openHere = item.dataset.ref && item.querySelector('a.on');
   const name = item.dataset.name;
@@ -1132,6 +1208,7 @@ aside.addEventListener('drop', async (e) => {
 def shell(
     title: str, body: str, script: str = "", query: str = "",
     current_ref: str = "", current_folder: str = "", closed: set[str] = frozenset(),
+    side_sort: str = "order",
 ) -> bytes:
     page = f"""<!doctype html>
 <html lang="ko"><head>
@@ -1147,7 +1224,7 @@ if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide
 </head><body>
 <header>
   <button class="btn" id="toggle" title="문서 목록 접기/펴기">☰</button>
-  <a class="brand" href="/" title="문서 목록">📚 {html.escape(wiki_name())}</a>
+  <a class="brand" href="{home_link()}" title="{home_title()}">📚 {html.escape(wiki_name())}</a>
   <span class="spacer"></span>
   <form action="/search" method="get" style="display:flex;gap:6px">
     <input type="search" name="q" placeholder="제목·본문 검색"
@@ -1157,7 +1234,7 @@ if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide
   <a class="btn" href="/settings" title="위키 이름 바꾸기">⚙</a>
 </header>
 <div class="layout">
-  <aside>{sidebar(current_ref, current_folder, closed)}</aside>
+  <aside>{sidebar(current_ref, current_folder, closed, side_sort)}</aside>
   <div class="grip" id="grip" title="끌어서 너비 조절"></div>
   <main>{body}</main>
 </div>
@@ -1168,6 +1245,16 @@ if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide
 
 def folder_link(folder: str) -> str:
     return "/?folder=" + urllib.parse.quote(folder)
+
+
+def home_link() -> str:
+    home = home_page()
+    return f"/w/{urllib.parse.quote(home)}" if home else "/"
+
+
+def home_title() -> str:
+    home = home_page()
+    return f"{home} (홈)" if home else "문서 목록"
 
 
 def crumbs(folder: str) -> str:
@@ -1372,9 +1459,36 @@ def view_body(ref: str) -> str:
         f'<span class="spacer"></span>'
         f'<button class="btn danger" id="remove">삭제</button>'
         f'<button class="btn" id="move">폴더 이동</button>'
+        f'<a class="btn" href="/new?folder={quoted}">아래에 새 글</a>'
         f'<a class="btn primary" href="/e/{quoted}">글 수정</a></div>'
         f"<h1>{html.escape(title_of(ref))}</h1>{render(read_page(ref))}"
+        f"{children_list(ref)}"
     )
+
+
+def children_list(ref: str) -> str:
+    """이 글 아래에 달린 글 목록."""
+    kids = children_of(ref)
+    if not kids:
+        return ""
+    changed = dict(list_pages())
+    rows = []
+    for name, is_folder in kids:
+        path = f"{ref}/{name}"
+        if is_folder:
+            rows.append(
+                f'<li><div class="row"><a href="{folder_link(path)}">📁 {html.escape(name)}</a>'
+                "</div></li>"
+            )
+        else:
+            when = changed.get(path)
+            stamp = f'<span class="meta">{when:%Y-%m-%d %H:%M}</span>' if when else ""
+            rows.append(
+                f'<li><div class="row">'
+                f'<a href="/w/{urllib.parse.quote(path)}">{html.escape(name)}</a>{stamp}'
+                "</div></li>"
+            )
+    return f'<div class="group"><h2>이 글 아래</h2><ul class="list">{"".join(rows)}</ul></div>'
 
 
 VIEW_SCRIPT = """
@@ -2242,9 +2356,11 @@ SETTINGS_SCRIPT = """
 const settingsStatus = document.getElementById('status');
 
 document.getElementById('save').onclick = async () => {
-  if (await post('/settings', {name: document.getElementById('name').value})) {
-    location.href = '/settings';
-  }
+  const done = await post('/settings', {
+    name: document.getElementById('name').value,
+    home: document.getElementById('home').value,
+  });
+  if (done) { location.href = '/settings'; }
 };
 
 document.getElementById('save-data').onclick = async () => {
@@ -2265,13 +2381,22 @@ document.getElementById('save-data').onclick = async () => {
 def settings_body() -> str:
     places = "".join(f'<option value="{html.escape(p, quote=True)}">' for p in sync_places())
     synced = DATA != ROOT
+    pages = "".join(
+        f'<option value="{html.escape(ref, quote=True)}">' for ref, _ in sorted(list_pages())
+    )
     return (
         "<h1>설정</h1>"
         "<h2>위키 이름</h2>"
         '<p class="hint">화면 왼쪽 위와 브라우저 탭에 표시됩니다.</p>'
         f'<p><input type="text" id="name" maxlength="40" style="width:320px" '
         f'value="{html.escape(wiki_name(), quote=True)}"></p>'
-        '<div class="toolbar"><button class="btn primary" id="save">이름 저장</button>'
+        "<h2>홈으로 쓸 글</h2>"
+        '<p class="hint">왼쪽 위 위키 이름을 눌렀을 때 열리는 글입니다. '
+        "비워 두면 문서 목록으로 갑니다.</p>"
+        f'<p><input type="text" id="home" list="pagelist" style="width:min(420px,100%)" '
+        f'placeholder="예: 가이드" value="{html.escape(read_config().get("home", ""), quote=True)}">'
+        f'<datalist id="pagelist">{pages}</datalist></p>'
+        '<div class="toolbar"><button class="btn primary" id="save">저장</button>'
         '<span id="status" class="meta"></span></div>'
         "<h2>데이터 폴더</h2>"
         '<p class="hint">글과 첨부가 저장되는 곳입니다. OneDrive 같은 동기화 폴더를 지정하면 '
@@ -2328,14 +2453,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return 1
 
-    def closed_folders(self) -> set[str]:
-        """접어 둔 폴더 목록. 브라우저가 쿠키로 알려 줍니다."""
-        raw = ""
+    def cookie(self, want: str) -> str:
         for part in (self.headers.get("Cookie") or "").split(";"):
             key, _, value = part.strip().partition("=")
-            if key == "closed":
-                raw = value
+            if key == want:
+                return value
+        return ""
+
+    def closed_folders(self) -> set[str]:
+        """접어 둔 폴더 목록. 브라우저가 쿠키로 알려 줍니다."""
+        raw = self.cookie("closed")
         return {urllib.parse.unquote(name) for name in raw.split("|") if name}
+
+    def side_sort(self) -> str:
+        chosen = self.cookie("sideSort")
+        return chosen if chosen in dict(SORTS) else "order"
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
@@ -2345,6 +2477,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         prefix, rest, query = self.split_path()
         name = wiki_name()
         closed = self.closed_folders()
+        side = self.side_sort()
 
         if prefix == "":
             folder = normalize_ref(query.get("folder", [""])[0])
@@ -2353,22 +2486,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             page = self.page_number(query)
             self.send(shell(
                 f"문서 목록 - {name}", index_body(folder, sort, page), INDEX_SCRIPT,
-                current_folder=folder, closed=closed,
+                current_folder=folder, closed=closed, side_sort=side,
             ))
         elif prefix == "new":
             folder = normalize_ref(query.get("folder", [""])[0])
-            self.send(shell(f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT, closed=closed))
+            self.send(shell(f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT, closed=closed, side_sort=side))
         elif prefix == "search":
             keyword = query.get("q", [""])[0].strip()
             self.send(shell(
                 f"검색 - {name}", search_body(keyword, self.page_number(query)), LIST_SCRIPT,
-                query=keyword, closed=closed,
+                query=keyword, closed=closed, side_sort=side,
             ))
         elif prefix == "settings":
-            self.send(shell(f"설정 - {name}", settings_body(), SETTINGS_SCRIPT, closed=closed))
+            self.send(shell(f"설정 - {name}", settings_body(), SETTINGS_SCRIPT, closed=closed, side_sort=side))
         elif prefix == "tree":
             folder = normalize_ref(query.get("folder", [""])[0])
-            rows = sidebar_rows(folder, folder.count("/") + 1, "", "", closed - {folder})
+            rows = sidebar_rows(folder, folder.count("/") + 1, "", "", closed - {folder}, side)
             self.send("".join(rows).encode("utf-8"))
         elif prefix in ("w", "e"):
             ref = normalize_ref(rest)
@@ -2378,12 +2511,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ref = resolve_ref(ref)
                 self.send(shell(
                     f"{title_of(ref)} - {name}", view_body(ref), VIEW_SCRIPT,
-                    current_ref=ref, closed=closed,
+                    current_ref=ref, closed=closed, side_sort=side,
                 ))
             else:
                 self.send(shell(
                     f"{title_of(ref)} 편집", edit_body(ref), EDITOR_SCRIPT,
-                    current_ref=ref, closed=closed,
+                    current_ref=ref, closed=closed, side_sort=side,
                 ))
         elif prefix == "f":
             self.serve_file(rest)
@@ -2410,12 +2543,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif prefix == "settings" and rest == "data":
             self.change_data_dir()
         elif prefix == "settings":
-            name = self.read_json().get("name", "").strip()
+            data = self.read_json()
+            name = data.get("name", "").strip()
+            home = normalize_ref(data.get("home", ""))
             if not name:
                 self.send_text(400, "위키 이름을 입력해 주세요.")
+            elif home and not page_exists(home):
+                self.send_text(400, f"‘{home}’ 글이 없습니다. 있는 글 이름을 넣어 주세요.")
             else:
-                set_wiki_name(name[:40])
-                self.send_json({"name": wiki_name()})
+                write_config({"name": name[:40], "home": home})
+                self.send_json({"name": wiki_name(), "home": home})
         elif prefix == "upload":
             self.save_upload()
         else:
@@ -2438,6 +2575,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         write_page(ref, data.get("text", ""))
         if original and original != ref:
+            if not move_children(original, ref):
+                self.send_text(400, f"‘{ref}’ 아래에 이미 다른 글이 있어 옮기지 못했습니다.")
+                return
             delete_page(original)
         self.send_json({"ref": ref})
 
@@ -2462,6 +2602,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_text(400, f"‘{new_ref}’ 문서가 이미 있습니다. 다른 폴더를 골라 주세요.")
                 return
             write_page(new_ref, read_page(ref))
+            if not move_children(ref, new_ref):
+                page_path(new_ref).unlink(missing_ok=True)
+                self.send_text(400, f"‘{new_ref}’ 아래에 이미 다른 글이 있어 옮기지 못했습니다.")
+                return
             delete_page(ref)
         self.send_json({"ref": new_ref})
 
@@ -2469,6 +2613,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ref = normalize_ref(self.read_json().get("ref", ""))
         if not page_exists(ref):
             self.send_text(400, "없는 문서입니다.")
+            return
+        under = [name for name, _ in list_pages() if in_folder(name, ref)]
+        if under:
+            self.send_text(400, f"이 글 아래에 글이 {len(under)}개 있습니다. 먼저 옮기거나 지워 주세요.")
             return
         delete_page(ref)
         self.send_json({"folder": folder_of(ref)})
