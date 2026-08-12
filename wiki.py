@@ -327,15 +327,16 @@ def delete_folder(folder: str) -> tuple[bool, str]:
     return True, f"‘{folder}’ 폴더를 지웠습니다."
 
 
-def store_upload(filename: str, data: bytes) -> str:
+def store_upload(filename: str, data: bytes, replace: bool = False) -> str:
     """첨부를 files/ 에 저장하고 실제 저장된 파일명을 반환합니다."""
     name = INVALID_CHARS.sub("_", Path(filename).name) or "file"
     target = FILES / name
-    stem, suffix = Path(name).stem, Path(name).suffix
-    index = 1
-    while target.exists():
-        target = FILES / f"{stem}-{index}{suffix}"
-        index += 1
+    if not replace:
+        stem, suffix = Path(name).stem, Path(name).suffix
+        index = 1
+        while target.exists():
+            target = FILES / f"{stem}-{index}{suffix}"
+            index += 1
     target.write_bytes(data)
     return target.name
 
@@ -396,10 +397,33 @@ class WikiLinkExtension(Extension):
         md.inlinePatterns.register(WikiLinkProcessor(WIKILINK_RE, md), "wikilink", 170)
 
 
-MD = markdown.Markdown(
-    extensions=["extra", "sane_lists", "nl2br", "toc", WikiLinkExtension()],
-    output_format="html",
-)
+try:  # 코드에 색을 입히는 데 씁니다. 없으면 색 없이 그대로 보여 줍니다.
+    from pygments.formatters import HtmlFormatter
+
+    CODE_EXTENSION = ["codehilite"]
+    CODE_CSS = (
+        HtmlFormatter(style="default").get_style_defs(".highlight")
+        + "\n@media (prefers-color-scheme: dark) {\n"
+        + HtmlFormatter(style="monokai").get_style_defs(":root:not([data-theme=light]) .highlight")
+        + "\n}\n"
+    )
+except ImportError:
+    CODE_EXTENSION = []
+    CODE_CSS = ""
+
+def build_markdown(highlight: bool) -> markdown.Markdown:
+    extensions = ["extra", "sane_lists", "nl2br", "toc", WikiLinkExtension()]
+    return markdown.Markdown(
+        extensions=extensions + (CODE_EXTENSION if highlight else []),
+        extension_configs={"codehilite": {"guess_lang": False, "css_class": "highlight"}},
+        output_format="html",
+    )
+
+
+MD = build_markdown(True)
+# 색을 입히면 코드 종류가 HTML 에서 사라져 서식 편집으로 되돌릴 수 없으므로,
+# 편집 화면에는 색 없이 종류만 남긴 판을 씁니다.
+MD_PLAIN = build_markdown(False)
 
 
 MD_LOCK = threading.Lock()
@@ -421,10 +445,11 @@ def loosen(text: str) -> str:
     return "\n".join(lines)
 
 
-def render(text: str) -> str:
+def render(text: str, highlight: bool = True) -> str:
+    engine = MD if highlight else MD_PLAIN
     with MD_LOCK:
-        MD.reset()
-        return MD.convert(loosen(text))
+        engine.reset()
+        return engine.convert(loosen(text))
 
 
 class MarkdownWriter(HTMLParser):
@@ -625,7 +650,7 @@ CSS = """
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html { --head: 61px; }
+html { --head: 61px; --side: 260px; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
   font: 16px/1.7 "Pretendard", "Malgun Gothic", -apple-system, sans-serif;
@@ -641,15 +666,22 @@ header .brand {
 header .spacer { flex: 1; }
 .layout { display: flex; align-items: flex-start; }
 aside {
-  width: 260px; flex: none; padding: 16px 8px; border-right: 1px solid var(--line);
+  width: var(--side); flex: none; padding: 16px 8px; border-right: 1px solid var(--line);
   position: sticky; top: var(--head); height: calc(100vh - var(--head)); overflow-y: auto;
 }
-html.nosidebar aside { display: none; }
-@media (max-width: 820px) { aside { display: none; } }
+.grip {
+  flex: none; width: 6px; cursor: col-resize; position: sticky; top: var(--head);
+  height: calc(100vh - var(--head));
+}
+.grip:hover, .grip.on { background: var(--accent); }
+html.nosidebar aside, html.nosidebar .grip { display: none; }
+@media (max-width: 820px) { aside, .grip { display: none; } }
 aside .side-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
   font-size: 13px; color: var(--muted); padding: 0 8px 8px;
 }
+aside .side-acts { display: flex; align-items: center; gap: 6px; flex: none; }
+aside .side-acts .btn { padding: 2px 8px; font-size: 12px; line-height: 1.6; }
 aside .item { display: flex; align-items: center; border-radius: 6px; cursor: grab; }
 aside .item.dragging { opacity: .4; }
 aside .item.drop > a { outline: 2px dashed var(--accent); outline-offset: -2px; }
@@ -707,7 +739,11 @@ img { max-width: 100%; border-radius: 6px; }
 .group h2 { font-size: 15px; color: var(--muted); border: none; padding: 0; margin: 0; }
 .list { list-style: none; padding: 0; margin: 6px 0 0; }
 .list li { padding: 12px 4px; border-bottom: 1px solid var(--line); }
-.list .row { display: flex; justify-content: space-between; gap: 12px; }
+.list .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.list .row > a { flex: 1; min-width: 0; }
+.list .acts { display: none; gap: 6px; }
+.list li:hover .acts { display: flex; }
+.list .acts .btn { padding: 2px 10px; font-size: 12px; }
 .list a { text-decoration: none; font-weight: 500; }
 .list .snippet { color: var(--muted); font-size: 14px; margin-top: 4px; }
 .empty { color: var(--muted); padding: 40px 0; text-align: center; }
@@ -725,8 +761,8 @@ img { max-width: 100%; border-radius: 6px; }
   font: 14px/1.7 "Cascadia Mono", Consolas, monospace; resize: vertical;
 }
 #editor.drag { border-color: var(--accent); border-style: dashed; }
-.mdbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
-.mdbar .btn { padding: 4px 10px; font-size: 13px; }
+.mdbar, .drawbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
+.mdbar .btn, .drawbar .btn { padding: 4px 10px; font-size: 13px; }
 .tabs { display: flex; gap: 6px; margin-bottom: 8px; }
 #rich {
   min-height: 55vh; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px;
@@ -753,6 +789,28 @@ img { max-width: 100%; border-radius: 6px; }
 }
 #grid input:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
 #grid tr:first-child input { font-weight: 700; background: var(--card); }
+#link-modal .sheet { width: min(680px, 92vw); }
+#link-folder { width: 34%; font-size: 15px; color: var(--muted); }
+#link-title { flex: 1; font-size: 18px; font-weight: 700; }
+#link-folder, #link-title {
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--fg); min-width: 0;
+}
+#link-text {
+  width: 100%; min-height: 220px; padding: 12px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--card); color: var(--fg);
+  font: 14px/1.7 "Cascadia Mono", Consolas, monospace; resize: vertical;
+}
+#canvas {
+  border: 1px solid var(--line); border-radius: 8px; touch-action: none; cursor: crosshair;
+  max-width: 100%; height: auto; background: #ffffff;
+}
+.swatch {
+  width: 24px; height: 24px; border: 2px solid var(--line); border-radius: 50%;
+  cursor: pointer; padding: 0;
+}
+.swatch.on { border-color: var(--accent); transform: scale(1.15); }
+#rich img { cursor: pointer; }
 .toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
 .toolbar .spacer { flex: 1; }
 .hint { color: var(--muted); font-size: 13px; }
@@ -785,6 +843,7 @@ def sidebar_rows(
                 f'<a class="folder{state}" draggable="false" style="padding-left:2px" '
                 f'href="{folder_link(path)}">📁 {html.escape(name)}</a>'
                 '<span class="acts">'
+                '<button data-act="write" title="이 폴더에 새 글">📄</button>'
                 '<button data-act="add" title="하위 폴더 추가">＋</button>'
                 '<button data-act="rename" title="폴더 이름·위치 바꾸기">✎</button>'
                 '<button data-act="remove" title="폴더 삭제">✕</button>'
@@ -798,7 +857,11 @@ def sidebar_rows(
                 f'{common}data-ref="{html.escape(path, quote=True)}" '
                 f'data-folder="{html.escape(parent, quote=True)}">'
                 f'<a class="doc{state}" draggable="false" style="padding-left:{indent + 20}px" '
-                f'href="/w/{urllib.parse.quote(path)}">{html.escape(name)}</a></div>'
+                f'href="/w/{urllib.parse.quote(path)}">{html.escape(name)}</a>'
+                '<span class="acts">'
+                '<button data-act="edit" title="글 고치기">✎</button>'
+                '<button data-act="erase" title="글 삭제">✕</button>'
+                "</span></div>"
             )
     return rows
 
@@ -812,8 +875,10 @@ def sidebar(current_ref: str = "", current_folder: str = "", closed: set[str] = 
     body = body or '<div class="none">아직 문서가 없습니다.</div>'
     return (
         '<div class="side-head"><span>문서 목록</span>'
-        '<button class="btn" id="side-create" style="padding:2px 8px" '
-        'title="새 폴더 만들기">＋ 폴더</button></div>' + body
+        '<span class="side-acts">'
+        '<a class="btn" href="/new" title="새 글 쓰기">＋ 글</a>'
+        '<button class="btn" id="side-create" title="새 폴더 만들기">＋ 폴더</button>'
+        "</span></div>" + body
     )
 
 
@@ -857,6 +922,17 @@ async function movePage(ref, folder) {
   const moved = await post('/move', {ref: ref, folder: to});
   if (moved) { location.href = '/w/' + encodeURIComponent(moved.ref); }
 }
+
+async function renamePage(ref, title) {
+  const to = prompt('글 제목을 고쳐 주세요.', title);
+  if (!to || to === title) { return; }
+  if (await post('/move', {ref: ref, title: to})) { location.reload(); }
+}
+
+async function removePage(ref) {
+  if (!confirm('‘' + ref + '’ 글을 지울까요? 되돌릴 수 없습니다.')) { return; }
+  if (await post('/delete', {ref: ref})) { location.reload(); }
+}
 """
 
 LAYOUT_SCRIPT = """
@@ -868,6 +944,27 @@ document.getElementById('toggle').onclick = () => {
   const off = document.documentElement.classList.toggle('nosidebar');
   localStorage.setItem('sidebar', off ? 'off' : 'on');
 };
+
+// 목록과 본문 사이를 끌어 목록 너비를 조절합니다. 정한 너비는 다음에도 그대로 씁니다.
+const grip = document.getElementById('grip');
+grip.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  grip.setPointerCapture(e.pointerId);
+  grip.classList.add('on');
+  const drag = (move) => {
+    const wide = Math.min(560, Math.max(160, Math.round(move.clientX)));
+    document.documentElement.style.setProperty('--side', wide + 'px');
+  };
+  const stop = () => {
+    grip.classList.remove('on');
+    grip.removeEventListener('pointermove', drag);
+    localStorage.setItem('sideWidth',
+      document.documentElement.style.getPropertyValue('--side') || '260px');
+  };
+  grip.addEventListener('pointermove', drag);
+  grip.addEventListener('pointerup', stop, {once: true});
+  grip.addEventListener('pointercancel', stop, {once: true});
+});
 
 const aside = document.querySelector('aside');
 
@@ -881,6 +978,9 @@ aside.onclick = (e) => {
   else if (act === 'add') { createFolder(item.dataset.folder); }
   else if (act === 'rename') { renameFolder(item.dataset.folder); }
   else if (act === 'remove') { removeFolder(item.dataset.folder); }
+  else if (act === 'write') { location.href = '/new?folder=' + encodeURIComponent(item.dataset.folder); }
+  else if (act === 'edit') { renamePage(item.dataset.ref, item.dataset.name); }
+  else if (act === 'erase') { removePage(item.dataset.ref); }
 };
 
 // 접어 둔 폴더는 서버가 아예 그리지 않습니다. 글이 많아져도 목록이 가볍게 유지됩니다.
@@ -954,13 +1054,13 @@ function clearDrop() {
   clearMarks();
 }
 
-async function reorder(parent, target, mode) {
+async function reorder(parent, target, mode, moving) {
   const siblings = [...aside.querySelectorAll('.item')]
-    .filter((el) => el.dataset.parent === parent && el !== dragged)
+    .filter((el) => el.dataset.parent === parent && el !== moving)
     .map(itemKey);
   const at = target ? siblings.indexOf(itemKey(target)) + (mode === 'after' ? 1 : 0)
                     : siblings.length;
-  siblings.splice(at < 0 ? siblings.length : at, 0, itemKey(dragged));
+  siblings.splice(at < 0 ? siblings.length : at, 0, itemKey(moving));
   return post('/order', {folder: parent, names: siblings});
 }
 
@@ -1003,20 +1103,24 @@ aside.addEventListener('dragleave', (e) => {
 
 aside.addEventListener('drop', async (e) => {
   e.preventDefault();
-  const item = dragged;
+  const item = dragged;          // dragend 가 먼저 와도 잃지 않도록 붙잡아 둡니다
   const spot = dropSpot(e);
   clearDrop();
   if (!item) { return; }
 
   const parent = spot.mode === 'inside' ? spot.item.dataset.folder
                : spot.mode === 'root' ? '' : spot.item.dataset.parent;
-  if (!await dropInto(item, parent)) { return; }
-  if (spot.mode !== 'inside') { await reorder(parent, spot.item, spot.mode); }
-  else { await reorder(parent, null, 'after'); }
-
-  const ref = item.dataset.ref;
-  if (ref && item.querySelector('a.on')) {
-    const name = item.dataset.name;
+  const openHere = item.dataset.ref && item.querySelector('a.on');
+  const name = item.dataset.name;
+  try {
+    if (!await dropInto(item, parent)) { return; }
+    // 폴더 안으로 넣을 때는 순서를 건드리지 않습니다. 접혀 있으면 형제를 알 수 없기 때문입니다.
+    if (spot.mode !== 'inside') { await reorder(parent, spot.item, spot.mode, item); }
+  } catch (error) {
+    alert('옮기지 못했습니다: ' + error);
+    return;
+  }
+  if (openHere) {
     location.href = '/w/' + encodeURIComponent(parent ? parent + '/' + name : name);
   } else {
     location.reload();
@@ -1032,18 +1136,18 @@ def shell(
     page = f"""<!doctype html>
 <html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title><style>{CSS}</style>
+<title>{html.escape(title)}</title><style>{CSS}{CODE_CSS}</style>
 <script>
 if (localStorage.getItem('sidebar') === 'off') {{
   document.documentElement.classList.add('nosidebar');
 }}
+const savedSide = localStorage.getItem('sideWidth');
+if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide); }}
 </script>
 </head><body>
 <header>
   <button class="btn" id="toggle" title="문서 목록 접기/펴기">☰</button>
-  <a class="brand" href="/w/{urllib.parse.quote(HOME)}">📚 {html.escape(wiki_name())}</a>
-  <a class="btn" href="/">문서 목록</a>
-  <a class="btn primary" href="/new">새 글 쓰기</a>
+  <a class="brand" href="/" title="문서 목록">📚 {html.escape(wiki_name())}</a>
   <span class="spacer"></span>
   <form action="/search" method="get" style="display:flex;gap:6px">
     <input type="search" name="q" placeholder="제목·본문 검색"
@@ -1054,6 +1158,7 @@ if (localStorage.getItem('sidebar') === 'off') {{
 </header>
 <div class="layout">
   <aside>{sidebar(current_ref, current_folder, closed)}</aside>
+  <div class="grip" id="grip" title="끌어서 너비 조절"></div>
   <main>{body}</main>
 </div>
 <script>{COMMON_SCRIPT}{LAYOUT_SCRIPT}{script}</script>
@@ -1088,8 +1193,13 @@ def entry_rows(
             f'<div class="snippet">{highlight(line, query)}</div>' for line in snippets
         )
         rows.append(
-            f'<li>{where}<div class="row">'
+            f'<li data-ref="{html.escape(ref, quote=True)}" '
+            f'data-name="{html.escape(title_of(ref), quote=True)}">{where}<div class="row">'
             f'<a href="/w/{urllib.parse.quote(ref)}">{highlight(title_of(ref), query)}</a>'
+            '<span class="acts">'
+            f'<a class="btn" href="/e/{urllib.parse.quote(ref)}">고치기</a>'
+            '<button class="btn" data-row="rename">제목</button>'
+            '<button class="btn" data-row="remove">삭제</button></span>'
             f'<span class="meta">{when:%Y-%m-%d %H:%M}</span></div>{snippet_html}</li>'
         )
     return f'<ul class="list">{"".join(rows)}</ul>'
@@ -1125,7 +1235,7 @@ def sorted_pages(folder: str, sort: str) -> list[tuple[str, datetime]]:
     elif sort == "old":
         pages = sorted(changed.items(), key=lambda item: item[1])
     elif sort == "name":
-        pages = sorted(changed.items(), key=lambda item: title_of(item[0]))
+        pages = sorted(changed.items(), key=lambda item: title_of(item[0]).casefold())
     else:
         pages = [(ref, changed[ref]) for ref in ordered_refs()]
     return [item for item in pages if in_folder(item[0], folder)]
@@ -1158,9 +1268,11 @@ def index_body(folder: str, sort: str = "order", page: int = 1) -> str:
         f'<h1>📁 {html.escape(folder)} <span class="meta">({len(pages)}개)</span></h1>' if folder
         else f'<h1>문서 목록 <span class="meta">({len(pages)}개)</span></h1>'
     )
-    tools = [f'<button class="btn" id="create">{"하위 폴더" if folder else "폴더"} 추가</button>']
+    tools = [
+        f'<a class="btn primary" href="/new{f"?folder={quoted}" if folder else ""}">새 글</a>',
+        f'<button class="btn" id="create">{"하위 폴더" if folder else "폴더"} 추가</button>',
+    ]
     if folder:
-        tools.insert(0, f'<a class="btn" href="/new?folder={quoted}">이 폴더에 새 글 쓰기</a>')
         tools.append('<button class="btn" id="rename">폴더 이름 바꾸기</button>')
         tools.append('<button class="btn" id="remove">폴더 삭제</button>')
     toolbar = (
@@ -1176,7 +1288,12 @@ def index_body(folder: str, sort: str = "order", page: int = 1) -> str:
         page = max(1, min(page, (len(pages) + LIST_LIMIT - 1) // LIST_LIMIT))
         shown = pages[(page - 1) * LIST_LIMIT:page * LIST_LIMIT]
         params = {"folder": folder, "sort": sort} if folder else {"sort": sort}
-        listing = grouped_rows(shown) + page_links(params, page, len(pages), LIST_LIMIT)
+        # 순서를 직접 정했을 때만 폴더별로 묶고, 그 밖에는 고른 기준대로 한 줄로 세웁니다.
+        rows = (
+            grouped_rows(shown) if sort == "order"
+            else entry_rows([(ref, when, []) for ref, when in shown], show_folder=True)
+        )
+        listing = rows + page_links(params, page, len(pages), LIST_LIMIT)
     choices = "".join(
         f'<option value="{key}"{" selected" if key == sort else ""}>{label}</option>'
         for key, label in SORTS
@@ -1189,7 +1306,17 @@ def index_body(folder: str, sort: str = "order", page: int = 1) -> str:
     return f"{crumbs(folder) if folder else ''}{heading}{toolbar}{picker}{listing}"
 
 
-INDEX_SCRIPT = """
+LIST_SCRIPT = """
+document.querySelector('main').addEventListener('click', (e) => {
+  const button = e.target.closest('button[data-row]');
+  if (!button) { return; }
+  const row = button.closest('li');
+  if (button.dataset.row === 'rename') { renamePage(row.dataset.ref, row.dataset.name); }
+  else { removePage(row.dataset.ref); }
+});
+"""
+
+INDEX_SCRIPT = LIST_SCRIPT + """
 const openFolder = document.getElementById('folder-tools').dataset.folder;
 const sortPicker = document.getElementById('sort');
 if (sortPicker) {
@@ -1274,13 +1401,32 @@ MD_BUTTONS = [
     ("링크", 'data-snippet="[보일 글자](https://)"'),
     ("문서 링크", 'data-snippet="[[문서 이름]]"'),
     ("표", 'data-table="1" data-rich="table"'),
+    ("그림", 'data-draw="1" data-rich="draw"'),
+    ("새 글로 연결", 'data-extract="1" data-rich="extract"'),
 ]
+
+CODE_LANGS = [
+    ("", "글자 그대로"), ("csharp", "C#"), ("cpp", "C++"), ("c", "C"), ("python", "Python"),
+    ("javascript", "JavaScript"), ("typescript", "TypeScript"), ("java", "Java"), ("go", "Go"),
+    ("rust", "Rust"), ("lua", "Lua"), ("sql", "SQL"), ("json", "JSON"), ("xml", "XML"),
+    ("html", "HTML"), ("css", "CSS"), ("bash", "셸"), ("powershell", "PowerShell"),
+    ("yaml", "YAML"), ("ini", "INI"), ("diff", "Diff"), ("markdown", "마크다운"),
+]
+
+DRAW_TOOLS = [
+    ("select", "선택"), ("pen", "자유선"), ("line", "직선"), ("rect", "사각형"),
+    ("ellipse", "타원"), ("arrow", "화살표"), ("erase", "지우개"),
+]
+DRAW_COLORS = ["#1f2328", "#cf222e", "#0969da", "#1a7f37", "#bf8700"]
 
 EDITOR_SCRIPT = """
 const editor = document.getElementById('editor');
 const titleInput = document.getElementById('title');
 const folderInput = document.getElementById('folder');
 const status = document.getElementById('status');
+const mdbar = document.getElementById('mdbar');
+const rich = document.getElementById('rich');
+let richMode = false;
 let original = editor.dataset.original;
 
 function typeText(text) {
@@ -1300,6 +1446,97 @@ function prefixLine(prefix) {
   const start = editor.value.lastIndexOf('\\n', editor.selectionStart - 1) + 1;
   editor.setSelectionRange(start, start);
   typeText(prefix);
+}
+
+// 고른 글자는 그대로 두고 링크만 걸면서, 이어질 새 글을 만듭니다.
+const linkModal = document.getElementById('link-modal');
+const linkFolder = document.getElementById('link-folder');
+const linkTitle = document.getElementById('link-title');
+const linkBody = document.getElementById('link-text');
+let linkRange = null;   // 서식 편집 모드에서 고른 자리
+let linkSpan = null;    // 마크다운 모드에서 고른 자리
+let linkLabel = '';     // 고른 글자 (링크에 보일 글자)
+
+function extractToPage() {
+  if (richMode) {
+    const chosen = document.getSelection();
+    if (!chosen.rangeCount || chosen.isCollapsed) {
+      status.textContent = '링크를 걸 글자를 먼저 골라 주세요.';
+      return;
+    }
+    linkRange = chosen.getRangeAt(0).cloneRange();
+    linkLabel = String(chosen);
+  } else {
+    if (editor.selectionStart === editor.selectionEnd) {
+      status.textContent = '링크를 걸 글자를 먼저 골라 주세요.';
+      return;
+    }
+    linkSpan = {start: editor.selectionStart, end: editor.selectionEnd};
+    linkLabel = editor.value.slice(linkSpan.start, linkSpan.end);
+  }
+  document.getElementById('link-label').textContent = '고른 글자: ' + linkLabel.trim();
+  linkFolder.value = folderInput.value.trim();
+  linkTitle.value = linkLabel.trim().slice(0, 100);
+  linkBody.value = '';
+  linkModal.hidden = false;
+  linkTitle.focus();
+  linkTitle.select();
+}
+
+function closeLinkModal() {
+  linkModal.hidden = true;
+  (richMode ? rich : editor).focus();
+}
+
+document.getElementById('link-make').onclick = async () => {
+  const title = linkTitle.value.trim();
+  if (!title) { linkTitle.focus(); return; }
+  const saved = await post('/save', {
+    original: '', folder: linkFolder.value.trim(), title: title, text: linkBody.value,
+  });
+  if (!saved) { return; }
+  const ref = saved.ref;
+  const label = linkLabel;
+  linkModal.hidden = true;
+  if (richMode) {
+    const chosen = document.getSelection();
+    chosen.removeAllRanges();
+    chosen.addRange(linkRange);
+    rich.focus();
+    const safe = label.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    document.execCommand('insertHTML', false,
+      '<a data-wiki="' + ref + '|' + label + '" href="/w/' + encodeURIComponent(ref) + '">'
+      + safe + '</a>');
+  } else {
+    editor.focus();
+    editor.setSelectionRange(linkSpan.start, linkSpan.end);
+    typeText(ref === label ? '[[' + label + ']]' : '[[' + ref + '|' + label + ']]');
+  }
+  status.textContent = '‘' + ref + '’ 를 만들고 링크를 걸었습니다. 이 글도 저장해 주세요.';
+};
+
+document.getElementById('link-cancel').onclick = closeLinkModal;
+linkModal.onclick = (e) => { if (e.target === linkModal) { closeLinkModal(); } };
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !linkModal.hidden) { closeLinkModal(); }
+});
+
+// 고른 영역을 코드 블록으로 감쌉니다. 종류를 고르면 그 문법에 맞춰 색이 입혀집니다.
+function insertCodeBlock(toRich) {
+  const lang = document.getElementById('code-lang').value;
+  if (toRich) {
+    const chosen = String(document.getSelection()).trim();
+    const body = (chosen || '여기에 코드를 씁니다')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\\n/g, '<br>');
+    rich.focus();
+    document.execCommand('insertHTML', false,
+      '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + body
+      + '</code></pre><p><br></p>');
+    return;
+  }
+  const chosen = editor.value.slice(editor.selectionStart, editor.selectionEnd);
+  const body = chosen.replace(/\\n+$/, '') || '여기에 코드를 씁니다';
+  typeText('```' + lang + '\\n' + body + '\\n```\\n');
 }
 
 async function save(leave) {
@@ -1347,18 +1584,24 @@ async function upload(files) {
 document.getElementById('save').onclick = () => save(false);
 document.getElementById('done').onclick = () => save(true);
 document.getElementById('picker').onchange = (e) => upload(e.target.files);
-document.querySelectorAll('.mdbar button').forEach((button) => {
+mdbar.querySelectorAll('button').forEach((button) => {
   button.onclick = () => {
     const data = button.dataset;
     if (richMode) {
       const [command, value] = data.rich.split(':');
       if (command === 'table') { openTable(); }
+      else if (command === 'draw') { openDraw(null); }
+      else if (command === 'code') { insertCodeBlock(true); }
+      else if (command === 'extract') { extractToPage(); }
       else { rich.focus(); document.execCommand(command, false, value); }
       return;
     }
     if (data.wrap) { wrapSelection(data.wrap, data.hint); }
     else if (data.prefix) { prefixLine(data.prefix); }
     else if (data.table) { openTable(); }
+    else if (data.draw) { openDraw(null); }
+    else if (data.code) { insertCodeBlock(false); }
+    else if (data.extract) { extractToPage(); }
     else { typeText(data.snippet); }
   };
 });
@@ -1444,12 +1687,333 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !tableModal.hidden) { closeTable(); }
 });
 
+// 그림 그리기: 도형을 SVG 로 그려 파일 하나로 저장하므로 나중에 다시 열어 고칠 수 있습니다.
+const NS = 'http://www.w3.org/2000/svg';
+const drawModal = document.getElementById('draw-modal');
+const canvas = document.getElementById('canvas');
+const markers = document.getElementById('markers');
+let tool = 'pen';
+let color = '#1f2328';
+let width = 3;
+let shape = null;
+let points = [];
+let editingImage = null;   // 기존 그림을 고치는 중이면 그 <img>
+let picked = [];           // 선택해 둔 도형
+let dragFrom = null;       // 도형을 끌고 있는 중이면 시작점
+let band = null;           // 빈 곳에서 끌어 고를 때 쓰는 사각형
+
+function drawPoint(e) {
+  const box = canvas.getBoundingClientRect();
+  return {
+    x: Math.round((e.clientX - box.left) / box.width * 800),
+    y: Math.round((e.clientY - box.top) / box.height * 500),
+  };
+}
+
+function shapes() {
+  return [...canvas.children].filter(
+    (node) => node !== canvas.firstElementChild && node !== markers);
+}
+
+function topShape(node) {
+  while (node && node.parentNode !== canvas) { node = node.parentNode; }
+  return node && node !== canvas.firstElementChild && node !== markers ? node : null;
+}
+
+function shift(node) {
+  const found = /translate\\(([-\\d.]+)[ ,]([-\\d.]+)\\)/.exec(node.getAttribute('transform') || '');
+  return found ? {x: Number(found[1]), y: Number(found[2])} : {x: 0, y: 0};
+}
+
+function moveTo(node, x, y) {
+  node.setAttribute('transform', `translate(${Math.round(x)} ${Math.round(y)})`);
+}
+
+function boxOf(node) {
+  const box = node.getBBox();
+  const at = shift(node);
+  return {x: box.x + at.x, y: box.y + at.y, width: box.width, height: box.height};
+}
+
+function showPicked() {
+  markers.replaceChildren();
+  for (const node of picked) {
+    const box = boxOf(node);
+    const frame = document.createElementNS(NS, 'rect');
+    frame.setAttribute('x', box.x - 5);
+    frame.setAttribute('y', box.y - 5);
+    frame.setAttribute('width', box.width + 10);
+    frame.setAttribute('height', box.height + 10);
+    frame.setAttribute('fill', 'none');
+    frame.setAttribute('stroke', '#0969da');
+    frame.setAttribute('stroke-width', '1.5');
+    frame.setAttribute('stroke-dasharray', '6 4');
+    frame.setAttribute('pointer-events', 'none');
+    markers.appendChild(frame);
+  }
+}
+
+function pick(nodes) {
+  picked = nodes;
+  showPicked();
+}
+
+function makeShape(kind) {
+  const node = document.createElementNS(NS, kind);
+  node.setAttribute('fill', 'none');
+  node.setAttribute('stroke', color);
+  node.setAttribute('stroke-width', width);
+  node.setAttribute('stroke-linecap', 'round');
+  node.setAttribute('stroke-linejoin', 'round');
+  canvas.insertBefore(node, markers);
+  return node;
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  const at = drawPoint(e);
+  if (tool === 'erase') {
+    // 맨 아래 흰 배경은 남기고 그 위에 그린 도형만 지웁니다.
+    const hit = topShape(e.target);
+    if (hit) { hit.remove(); pick(picked.filter((node) => node !== hit)); }
+    return;
+  }
+  if (tool === 'select') {
+    canvas.setPointerCapture(e.pointerId);
+    const hit = topShape(e.target);
+    if (hit) {
+      if (e.shiftKey) {
+        pick(picked.includes(hit) ? picked.filter((node) => node !== hit) : [...picked, hit]);
+      } else if (!picked.includes(hit)) {
+        pick([hit]);
+      }
+      dragFrom = at;
+      points = picked.map((node) => shift(node));
+    } else {
+      if (!e.shiftKey) { pick([]); }
+      band = makeShape('rect');
+      band.setAttribute('stroke', '#0969da');
+      band.setAttribute('stroke-width', '1');
+      band.setAttribute('stroke-dasharray', '5 4');
+      points = [at];
+    }
+    return;
+  }
+  canvas.setPointerCapture(e.pointerId);
+  pick([]);
+  points = [at];
+  if (tool === 'pen') {
+    shape = makeShape('path');
+    shape.setAttribute('d', `M ${at.x} ${at.y}`);
+  } else if (tool === 'rect') {
+    shape = makeShape('rect');
+  } else if (tool === 'ellipse') {
+    shape = makeShape('ellipse');
+  } else {
+    shape = makeShape('path');
+  }
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  const spot = drawPoint(e);
+  if (dragFrom) {
+    picked.forEach((node, index) => {
+      moveTo(node, points[index].x + spot.x - dragFrom.x, points[index].y + spot.y - dragFrom.y);
+    });
+    showPicked();
+    return;
+  }
+  if (band) {
+    const from = points[0];
+    band.setAttribute('x', Math.min(from.x, spot.x));
+    band.setAttribute('y', Math.min(from.y, spot.y));
+    band.setAttribute('width', Math.abs(spot.x - from.x));
+    band.setAttribute('height', Math.abs(spot.y - from.y));
+    return;
+  }
+  if (!shape) { return; }
+  const at = spot;
+  const from = points[0];
+  if (tool === 'pen') {
+    points.push(at);
+    shape.setAttribute('d', shape.getAttribute('d') + ` L ${at.x} ${at.y}`);
+  } else if (tool === 'rect') {
+    shape.setAttribute('x', Math.min(from.x, at.x));
+    shape.setAttribute('y', Math.min(from.y, at.y));
+    shape.setAttribute('width', Math.abs(at.x - from.x));
+    shape.setAttribute('height', Math.abs(at.y - from.y));
+  } else if (tool === 'ellipse') {
+    shape.setAttribute('cx', (from.x + at.x) / 2);
+    shape.setAttribute('cy', (from.y + at.y) / 2);
+    shape.setAttribute('rx', Math.abs(at.x - from.x) / 2);
+    shape.setAttribute('ry', Math.abs(at.y - from.y) / 2);
+  } else if (tool === 'line') {
+    shape.setAttribute('d', `M ${from.x} ${from.y} L ${at.x} ${at.y}`);
+  } else if (tool === 'arrow') {
+    const angle = Math.atan2(at.y - from.y, at.x - from.x);
+    const head = 8 + width * 2;
+    const left = [at.x - head * Math.cos(angle - 0.4), at.y - head * Math.sin(angle - 0.4)];
+    const right = [at.x - head * Math.cos(angle + 0.4), at.y - head * Math.sin(angle + 0.4)];
+    shape.setAttribute('d', `M ${from.x} ${from.y} L ${at.x} ${at.y}`
+      + ` M ${left[0].toFixed(1)} ${left[1].toFixed(1)} L ${at.x} ${at.y}`
+      + ` L ${right[0].toFixed(1)} ${right[1].toFixed(1)}`);
+  }
+});
+
+for (const done of ['pointerup', 'pointerleave', 'pointercancel']) {
+  canvas.addEventListener(done, () => {
+    if (band) {
+      const area = {
+        x: Number(band.getAttribute('x') || 0), y: Number(band.getAttribute('y') || 0),
+        w: Number(band.getAttribute('width') || 0), h: Number(band.getAttribute('height') || 0),
+      };
+      band.remove();
+      band = null;
+      const inside = shapes().filter((node) => {
+        const box = boxOf(node);
+        return box.x >= area.x && box.y >= area.y
+          && box.x + box.width <= area.x + area.w && box.y + box.height <= area.y + area.h;
+      });
+      pick([...new Set([...picked, ...inside])]);
+    }
+    dragFrom = null;
+    shape = null;
+  });
+}
+
+document.getElementById('draw-group').onclick = () => {
+  if (picked.length < 2) { return; }
+  const bundle = document.createElementNS(NS, 'g');
+  canvas.insertBefore(bundle, markers);
+  picked.forEach((node) => bundle.appendChild(node));
+  pick([bundle]);
+};
+
+document.getElementById('draw-ungroup').onclick = () => {
+  const loose = [];
+  for (const node of picked) {
+    if (node.tagName !== 'g') { loose.push(node); continue; }
+    const at = shift(node);
+    while (node.firstElementChild) {
+      const child = node.firstElementChild;
+      const childAt = shift(child);
+      canvas.insertBefore(child, node);
+      moveTo(child, childAt.x + at.x, childAt.y + at.y);
+      loose.push(child);
+    }
+    node.remove();
+  }
+  pick(loose);
+};
+
+document.querySelectorAll('[data-tool]').forEach((button) => {
+  button.onclick = () => {
+    tool = button.dataset.tool;
+    canvas.style.cursor = tool === 'select' ? 'default'
+      : tool === 'erase' ? 'pointer' : 'crosshair';
+    if (tool !== 'select') { pick([]); }
+    document.querySelectorAll('[data-tool]').forEach((b) => b.classList.toggle('primary', b === button));
+  };
+});
+document.querySelectorAll('[data-color]').forEach((button) => {
+  button.onclick = () => {
+    color = button.dataset.color;
+    document.querySelectorAll('[data-color]').forEach((b) => b.classList.toggle('on', b === button));
+  };
+});
+document.querySelectorAll('[data-width]').forEach((button) => {
+  button.onclick = () => {
+    width = Number(button.dataset.width);
+    document.querySelectorAll('[data-width]').forEach((b) => b.classList.toggle('primary', b === button));
+  };
+});
+
+document.getElementById('draw-undo').onclick = () => {
+  const drawn = shapes();
+  if (drawn.length) {
+    const last = drawn[drawn.length - 1];
+    last.remove();
+    pick(picked.filter((node) => node !== last));
+  }
+};
+document.getElementById('draw-clear').onclick = () => {
+  shapes().forEach((node) => node.remove());
+  pick([]);
+};
+
+async function openDraw(image) {
+  editingImage = image || null;
+  shapes().forEach((node) => node.remove());
+  pick([]);
+  if (image) {
+    const res = await fetch(image.getAttribute('src'));
+    const text = await res.text();
+    const loaded = new DOMParser().parseFromString(text, 'image/svg+xml').documentElement;
+    [...loaded.children].slice(1).forEach((node) => canvas.insertBefore(node, markers));
+  }
+  drawModal.hidden = false;
+}
+
+function closeDraw() {
+  drawModal.hidden = true;
+  editingImage = null;
+  (richMode ? rich : editor).focus();
+}
+
+document.getElementById('draw-insert').onclick = async () => {
+  const copy = canvas.cloneNode(true);
+  copy.setAttribute('xmlns', NS);
+  copy.querySelector('#markers').remove();   // 선택 표시는 저장하지 않습니다
+  const svg = new XMLSerializer().serializeToString(copy);
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const name = editingImage
+    ? decodeURIComponent(editingImage.getAttribute('src').split('/f/')[1])
+    : '그림-' + stamp + '.svg';
+  status.textContent = '그림 저장 중...';
+  const res = await fetch('/upload' + (editingImage ? '?replace=1' : ''), {
+    method: 'POST',
+    headers: {'X-Filename': encodeURIComponent(name), 'Content-Type': 'image/svg+xml'},
+    body: svg,
+  });
+  if (!res.ok) { status.textContent = '그림을 저장하지 못했습니다.'; return; }
+  const saved = await res.json();
+  const link = '/f/' + encodeURIComponent(saved.name);
+  const wasEditing = editingImage;
+  closeDraw();
+  if (wasEditing) {
+    wasEditing.setAttribute('src', link + '?t=' + Date.now());
+    status.textContent = '그림을 고쳤습니다 (저장을 눌러야 반영됩니다)';
+    return;
+  }
+  if (richMode) {
+    rich.focus();
+    document.execCommand('insertHTML', false, '<img src="' + link + '" alt="' + saved.name + '">');
+  } else {
+    typeText('![' + saved.name + '](' + link + ')\\n');
+  }
+  status.textContent = saved.name + ' 넣었습니다 (저장을 눌러야 반영됩니다)';
+};
+
+document.getElementById('draw-cancel').onclick = closeDraw;
+drawModal.onclick = (e) => { if (e.target === drawModal) { closeDraw(); } };
+document.addEventListener('keydown', (e) => {
+  if (drawModal.hidden) { return; }
+  if (e.key === 'Escape') { closeDraw(); }
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && picked.length) {
+    e.preventDefault();
+    picked.forEach((node) => node.remove());
+    pick([]);
+  }
+});
+
+// 서식 편집 모드에서 그림을 두 번 누르면 다시 고칠 수 있습니다.
+rich.addEventListener('dblclick', (e) => {
+  const image = e.target.closest('img');
+  if (image && image.getAttribute('src').endsWith('.svg')) { openDraw(image); }
+});
+
 // 두 가지 편집 모드: 마크다운 원본을 그대로 고치거나, 꾸며진 화면에서 바로 고칩니다.
 const tabText = document.getElementById('tab-text');
 const tabRich = document.getElementById('tab-rich');
-const rich = document.getElementById('rich');
-const mdbar = document.querySelector('.mdbar');
-let richMode = false;
 
 async function pullFromRich() {
   const done = await post('/tomarkdown', {html: rich.innerHTML});
@@ -1472,7 +2036,7 @@ async function setMode(toRich) {
   rich.hidden = !toRich;
   tabText.classList.toggle('primary', !toRich);
   tabRich.classList.toggle('primary', toRich);
-  for (const button of document.querySelectorAll('.mdbar button')) {
+  for (const button of mdbar.querySelectorAll('button')) {
     button.disabled = toRich && !button.dataset.rich;
   }
   (toRich ? rich : editor).focus();
@@ -1519,7 +2083,7 @@ editor.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey) { return; }
-  const found = lineHere().text.match(/^(\s*)([-*+] |\d+[.)] |> )(.*)$/);
+  const found = lineHere().text.match(/^(\\s*)([-*+] |\\d+[.)] |> )(.*)$/);
   if (!found) { return; }
   e.preventDefault();
   if (!found[3].trim()) {
@@ -1556,11 +2120,74 @@ for (const box of [editor, rich]) {
 """
 
 
+def draw_modal() -> str:
+    tools = "".join(
+        f'<button class="btn{" primary" if key == "pen" else ""}" data-tool="{key}">{label}</button>'
+        for key, label in DRAW_TOOLS
+    )
+    colors = "".join(
+        f'<button class="swatch{" on" if index == 0 else ""}" data-color="{color}" '
+        f'style="background:{color}" title="{color}"></button>'
+        for index, color in enumerate(DRAW_COLORS)
+    )
+    widths = "".join(
+        f'<button class="btn{" primary" if size == 3 else ""}" data-width="{size}">{size}</button>'
+        for size in (2, 3, 6)
+    )
+    return (
+        '<div class="modal" id="draw-modal" hidden><div class="sheet">'
+        "<h2>그림 그리기</h2>"
+        f'<div class="drawbar">{tools}</div>'
+        f'<div class="drawbar"><span class="meta">색</span>{colors}'
+        f'<span class="meta" style="margin-left:8px">굵기</span>{widths}'
+        '<span class="spacer"></span>'
+        '<button class="btn" id="draw-group">묶기</button>'
+        '<button class="btn" id="draw-ungroup">풀기</button>'
+        '<button class="btn" id="draw-undo">되돌리기</button>'
+        '<button class="btn" id="draw-clear">전체 지우기</button></div>'
+        '<svg id="canvas" viewBox="0 0 800 500" width="800" height="500">'
+        '<rect x="0" y="0" width="800" height="500" fill="#ffffff"></rect>'
+        '<g id="markers"></g></svg>'
+        '<div class="toolbar">'
+        '<span class="hint">끌어서 그립니다. <b>선택</b> 으로 도형을 눌러 옮기고, '
+        '여러 개는 Shift+클릭이나 빈 곳에서 끌어 고른 뒤 <b>묶기</b> 로 하나로 만듭니다. '
+        'Delete 로 지웁니다.</span>'
+        '<span class="spacer"></span>'
+        '<button class="btn primary" id="draw-insert">넣기</button>'
+        '<button class="btn" id="draw-cancel">취소</button>'
+        "</div></div></div>"
+    )
+
+
+def link_modal() -> str:
+    return (
+        '<div class="modal" id="link-modal" hidden><div class="sheet">'
+        "<h2>새 글로 연결</h2>"
+        '<p class="hint">고른 글자는 그대로 두고 링크만 걸립니다. 이어질 새 글의 제목과 '
+        "내용을 여기서 정합니다. 내용은 비워 두고 나중에 채워도 됩니다.</p>"
+        '<div class="titlerow">'
+        '<input type="text" id="link-folder" placeholder="폴더 (비우면 맨 바깥)">'
+        '<input type="text" id="link-title" placeholder="새 글 제목" maxlength="100">'
+        "</div>"
+        '<textarea id="link-text" placeholder="새 글 내용" spellcheck="false"></textarea>'
+        '<div class="toolbar"><span class="hint" id="link-label"></span>'
+        '<span class="spacer"></span>'
+        '<button class="btn primary" id="link-make">만들고 링크 걸기</button>'
+        '<button class="btn" id="link-cancel">취소</button>'
+        "</div></div></div>"
+    )
+
+
 def edit_body(ref: str, folder: str = "") -> str:
     exists = page_exists(ref)
     folder = folder_of(ref) or folder
     title = title_of(ref) if ref else ""
     buttons = "".join(f'<button class="btn" {attrs}>{label}</button>' for label, attrs in MD_BUTTONS)
+    langs = "".join(f'<option value="{key}">{label}</option>' for key, label in CODE_LANGS)
+    buttons += (
+        f'<select id="code-lang" title="코드 종류">{langs}</select>'
+        '<button class="btn" data-code="1" data-rich="code">코드블록</button>'
+    )
     options = "".join(f'<option value="{html.escape(name, quote=True)}">' for name in list_folders())
     cancel_href = f"/w/{urllib.parse.quote(ref)}" if exists else "/"
     return (
@@ -1575,7 +2202,7 @@ def edit_body(ref: str, folder: str = "") -> str:
         '<button class="btn primary" id="tab-text">마크다운</button>'
         '<button class="btn" id="tab-rich">서식 편집</button>'
         "</div>"
-        f'<div class="mdbar">{buttons}</div>'
+        f'<div class="mdbar" id="mdbar">{buttons}</div>'
         f'<textarea id="editor" data-original="{html.escape(ref if exists else "", quote=True)}" '
         f'placeholder="본문을 마크다운으로 씁니다." spellcheck="false">'
         f"{html.escape(read_page(ref))}</textarea>"
@@ -1593,6 +2220,7 @@ def edit_body(ref: str, folder: str = "") -> str:
         '<button class="btn primary" id="table-insert">넣기</button>'
         '<button class="btn" id="table-cancel">취소</button>'
         "</div></div></div>"
+        + draw_modal() + link_modal() +
         '<div class="toolbar">'
         '<button class="btn primary" id="done">게시</button>'
         '<button class="btn" id="save">저장 (Ctrl+S)</button>'
@@ -1675,6 +2303,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # 글을 고치거나 옮긴 뒤 옛 화면이 다시 나오지 않도록 캐시를 쓰지 않습니다.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1731,7 +2361,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif prefix == "search":
             keyword = query.get("q", [""])[0].strip()
             self.send(shell(
-                f"검색 - {name}", search_body(keyword, self.page_number(query)),
+                f"검색 - {name}", search_body(keyword, self.page_number(query)), LIST_SCRIPT,
                 query=keyword, closed=closed,
             ))
         elif prefix == "settings":
@@ -1772,7 +2402,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif prefix == "order":
             self.save_order()
         elif prefix == "preview":
-            self.send_json({"html": render(self.read_json().get("text", ""))})
+            self.send_json({"html": render(self.read_json().get("text", ""), highlight=False)})
         elif prefix == "tomarkdown":
             self.send_json({"text": to_markdown(self.read_json().get("html", ""))})
         elif prefix == "folder":
@@ -1812,16 +2442,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"ref": ref})
 
     def move_page(self):
+        """글을 다른 폴더로 옮기거나 제목을 바꿉니다. 준 값만 바뀝니다."""
         data = self.read_json()
         ref = normalize_ref(data.get("ref", ""))
-        folder = normalize_ref(data.get("folder", ""))
         if not page_exists(ref):
             self.send_text(400, "없는 문서입니다.")
             return
+        folder = normalize_ref(data["folder"]) if "folder" in data else folder_of(ref)
+        title = data.get("title", "").strip() or title_of(ref)
         if folder and not is_valid_ref(folder):
             self.send_text(400, r'폴더 이름에 \ : * ? " < > | 는 쓸 수 없습니다.')
             return
-        new_ref = f"{folder}/{title_of(ref)}" if folder else title_of(ref)
+        if not is_valid_name(title):
+            self.send_text(400, r'제목에 \ / : * ? " < > | 는 쓸 수 없습니다.')
+            return
+        new_ref = f"{folder}/{title}" if folder else title
         if new_ref != ref:
             if page_exists(new_ref):
                 self.send_text(400, f"‘{new_ref}’ 문서가 이미 있습니다. 다른 폴더를 골라 주세요.")
@@ -1898,7 +2533,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def save_upload(self):
         length = int(self.headers.get("Content-Length", 0))
         name = urllib.parse.unquote(self.headers.get("X-Filename", "file"))
-        saved = store_upload(name, self.rfile.read(length))
+        _, _, query = self.split_path()
+        saved = store_upload(name, self.rfile.read(length), replace="replace" in query)
         link = "/f/" + urllib.parse.quote(saved)
         is_image = (mimetypes.guess_type(saved)[0] or "").startswith("image/")
         snippet = f"![{saved}]({link})" if is_image else f"[{saved}]({link})"
@@ -1938,7 +2574,7 @@ def main():
     port = int(args[0]) if args else DEFAULT_PORT
 
     use_data_dir(Path(data).expanduser() if data else saved_data_dir())
-    if not page_exists(HOME):
+    if not list_pages():  # 글이 하나도 없을 때만 안내글을 놓아 둡니다
         write_page(HOME, WELCOME)
 
     url = f"http://localhost:{port}/"
@@ -1991,6 +2627,8 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
 - 외부 주소는 `[이름](https://example.com)` 형식의 보통 마크다운으로 씁니다.
 - 편집 화면에 이미지나 파일을 드래그해서 놓거나, 스크린샷을 그대로 붙여넣으면
   `files/` 폴더에 저장되고 본문에 링크가 삽입됩니다.
+- **그림** 단추로 자유선·직선·사각형·타원·화살표를 그려 넣을 수 있습니다. 그림은 SVG 한 장으로
+  저장되고, 서식 편집 모드에서 그림을 두 번 누르면 다시 열어 고칠 수 있습니다.
 - 오른쪽 위 검색창에서 제목과 본문을 함께 찾습니다.
 - 위키 이름과 **데이터 폴더**는 오른쪽 위 ⚙ 에서 바꿉니다. 데이터 폴더를 OneDrive 같은
   동기화 폴더로 지정하면 다른 기기에서도 같은 내용을 보고 고칠 수 있습니다.
