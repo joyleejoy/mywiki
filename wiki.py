@@ -44,6 +44,7 @@ DEFAULT_PORT = 8800
 
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 WIKILINK_RE = r"\[\[([^\[\]]+?)\]\]"
+NOTE_RE = r"\{\{([\s\S]+?)\|\|([\s\S]+?)\}\}"  # 메모는 여러 줄일 수 있습니다
 
 
 # ---------------------------------------------------------------- 데이터 폴더
@@ -180,6 +181,41 @@ def write_page(ref: str, text: str) -> None:
 def delete_page(ref: str) -> None:
     page_path(ref).unlink(missing_ok=True)
     forget_scan()
+
+
+def add_note(ref: str, quote: str, note: str) -> tuple[bool, str]:
+    """글의 고른 부분을 메모 표시로 감쌉니다."""
+    text = read_page(ref)
+    at = text.find(quote) if quote else -1
+    if at < 0 and quote:
+        # 화면에서 고른 글자는 줄바꿈·공백이 원문과 다를 수 있어 느슨하게 한 번 더 찾습니다.
+        loose = re.compile(r"\s+".join(re.escape(part) for part in quote.split()))
+        found = loose.search(text)
+        at, quote = (found.start(), found.group(0)) if found else (-1, quote)
+    if at < 0:
+        return False, "고른 글자를 본문에서 찾지 못했습니다. 글을 고친 뒤 다시 해 주세요."
+
+    note = note.strip().replace("}}", "} }")
+    end = at + len(quote)
+    write_page(ref, text[:at] + "{{" + quote + "||" + note + "}}" + text[end:])
+    return True, "메모를 붙였습니다."
+
+
+def change_note(ref: str, quote: str, note: str | None) -> tuple[bool, str]:
+    """메모 내용을 고치거나(note), 표시를 걷어냅니다(note=None)."""
+    text = read_page(ref)
+    for found in re.finditer(NOTE_RE, text):
+        if found.group(1) != quote:
+            continue
+        if note is None:
+            body = quote
+            done = "메모를 지웠습니다."
+        else:
+            body = "{{" + quote + "||" + note.strip().replace("}}", "} }") + "}}"
+            done = "메모를 고쳤습니다."
+        write_page(ref, text[:found.start()] + body + text[found.end():])
+        return True, done
+    return False, "그 메모를 찾지 못했습니다."
 
 
 def move_children(old_ref: str, new_ref: str) -> bool:
@@ -423,9 +459,21 @@ class WikiLinkProcessor(InlineProcessor):
         return element, m.start(0), m.end(0)
 
 
+class NoteProcessor(InlineProcessor):
+    """{{고른 글자||메모}} 를 눌러서 볼 수 있는 메모 표시로 바꿉니다."""
+
+    def handleMatch(self, m, data):
+        element = ElementTree.Element("span")
+        element.text = m.group(1)
+        element.set("class", "note")
+        element.set("data-note", m.group(2))
+        return element, m.start(0), m.end(0)
+
+
 class WikiLinkExtension(Extension):
     def extendMarkdown(self, md):
         md.inlinePatterns.register(WikiLinkProcessor(WIKILINK_RE, md), "wikilink", 170)
+        md.inlinePatterns.register(NoteProcessor(NOTE_RE, md), "wikinote", 171)
 
 
 try:  # 코드에 색을 입히는 데 씁니다. 없으면 색 없이 그대로 보여 줍니다.
@@ -443,7 +491,11 @@ except ImportError:
     CODE_CSS = ""
 
 def build_markdown(highlight: bool) -> markdown.Markdown:
-    extensions = ["extra", "sane_lists", "nl2br", "toc", WikiLinkExtension()]
+    # extra 에서 각주(footnotes)만 빼고 씁니다. 메모는 각주가 아니라 표시로 답니다.
+    extensions = [
+        "abbr", "attr_list", "def_list", "fenced_code", "md_in_html", "tables",
+        "sane_lists", "nl2br", "toc", WikiLinkExtension(),
+    ]
     return markdown.Markdown(
         extensions=extensions + (CODE_EXTENSION if highlight else []),
         extension_configs={"codehilite": {"guess_lang": False, "css_class": "highlight"}},
@@ -500,6 +552,7 @@ class MarkdownWriter(HTMLParser):
         self.link: list[str] = []            # 링크 여는 태그 정보
         self.cells: list[str] | None = None  # 표 한 줄
         self.fence_at: int | None = None     # 코드블록 여는 줄 자리 (언어 이름을 나중에 채움)
+        self.note: str | None = None         # 메모 표시 안에 있는 동안 담아 두는 메모 내용
         self.table_head = False
         self.table_width = 0
 
@@ -577,6 +630,9 @@ class MarkdownWriter(HTMLParser):
             else:
                 self.link.append(values.get("href", ""))
                 self.add("[")
+        elif tag == "span" and "data-note" in values:
+            self.add("{{")
+            self.note = values["data-note"]
         elif tag == "img":
             source = values.get("src", "")
             self.add(f'![{values.get("alt", "")}]({source})')
@@ -619,6 +675,9 @@ class MarkdownWriter(HTMLParser):
                 self.skip = max(0, self.skip - 1)
             else:
                 self.add(f"]({target})")
+        elif tag == "span" and self.note is not None:
+            self.add("||" + self.note + "}}")
+            self.note = None
         elif tag in ("td", "th") and self.cells is not None:
             self.cells.append(self.line.strip().replace("|", r"\|"))
             self.line = ""
@@ -843,6 +902,36 @@ img { max-width: 100%; border-radius: 6px; }
 }
 .swatch.on { border-color: var(--accent); transform: scale(1.15); }
 #rich img { cursor: pointer; }
+#note-bubble {
+  position: absolute; z-index: 20; padding: 4px 12px; font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
+}
+.note {
+  background: var(--mark); border-bottom: 2px solid #d4a72c; cursor: pointer;
+  border-radius: 2px;
+}
+.note::after { content: "📝"; font-size: .75em; vertical-align: super; margin-left: 2px; }
+.note.open { outline: 2px solid var(--accent); outline-offset: 1px; }
+#note-card {
+  position: absolute; z-index: 20; width: 260px; max-width: 80vw; padding: 10px 12px;
+  border: 1px solid var(--line); border-left: 3px solid #d4a72c; border-radius: 8px;
+  background: var(--bg); box-shadow: 0 4px 14px rgba(0, 0, 0, .2);
+  font-size: 14px; line-height: 1.6; white-space: pre-wrap;
+}
+#note-card .note-text {
+  outline: none; border-radius: 4px; padding: 2px 4px; margin: -2px -4px; cursor: text;
+}
+#note-card .note-text:hover { background: var(--card); }
+#note-card .note-text:focus { background: var(--card); box-shadow: 0 0 0 2px var(--accent); }
+#note-card .note-foot {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: 8px; font-size: 12px; color: var(--muted);
+}
+#note-card .drop-note {
+  font-size: 12px; color: var(--muted); background: none; border: none;
+  padding: 0; cursor: pointer;
+}
+#note-card .drop-note:hover { color: var(--new); }
 .toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
 .toolbar .spacer { flex: 1; }
 .hint { color: var(--muted); font-size: 13px; }
@@ -1463,6 +1552,9 @@ def view_body(ref: str) -> str:
         f'<a class="btn primary" href="/e/{quoted}">글 수정</a></div>'
         f"<h1>{html.escape(title_of(ref))}</h1>{render(read_page(ref))}"
         f"{children_list(ref)}"
+        f'<button class="btn primary" id="note-bubble" '
+        f'data-ref="{html.escape(ref, quote=True)}" hidden>📝 메모 붙이기</button>'
+        '<div id="note-card" hidden></div>'
     )
 
 
@@ -1492,6 +1584,102 @@ def children_list(ref: str) -> str:
 
 
 VIEW_SCRIPT = """
+// 본문에서 글자를 고르면 그 자리에 단추가 떠서, 고른 부분에 메모를 붙일 수 있습니다.
+const noteBubble = document.getElementById('note-bubble');
+const readArea = document.querySelector('main');
+let noteQuote = '';
+
+document.addEventListener('selectionchange', () => {
+  const chosen = document.getSelection();
+  const text = String(chosen).trim();
+  if (!text || !chosen.rangeCount || !readArea.contains(chosen.anchorNode)) {
+    noteBubble.hidden = true;
+    return;
+  }
+  noteQuote = text;
+  const box = chosen.getRangeAt(0).getBoundingClientRect();
+  noteBubble.style.top = (box.bottom + scrollY + 6) + 'px';
+  noteBubble.style.left = (box.left + scrollX) + 'px';
+  noteBubble.hidden = false;
+});
+
+noteBubble.onclick = async () => {
+  const note = prompt('‘' + noteQuote.slice(0, 40) + '’ 에 붙일 메모', '');
+  if (!note) { return; }
+  noteBubble.hidden = true;
+  if (await post('/note', {ref: noteBubble.dataset.ref, quote: noteQuote, note: note})) {
+    location.reload();
+  }
+};
+
+// 메모 표시를 누르면 옆에 메모가 뜹니다. 표시 자체는 껐다 켤 수 있습니다.
+const noteCard = document.getElementById('note-card');
+let openNote = null;
+
+function closeNote() {
+  noteCard.hidden = true;
+  if (openNote) { openNote.classList.remove('open'); }
+  openNote = null;
+}
+
+readArea.addEventListener('click', (e) => {
+  const mark = e.target.closest('.note');
+  if (!mark) {
+    if (!e.target.closest('#note-card')) { closeNote(); }
+    return;
+  }
+  if (mark === openNote) { closeNote(); return; }
+  closeNote();
+  openNote = mark;
+  mark.classList.add('open');
+  noteCard.replaceChildren();
+
+  // 메모 칸을 눌러 바로 고칩니다. 다른 곳을 누르면(또는 Ctrl+Enter) 저장됩니다.
+  const hint = document.createElement('span');
+  hint.className = 'note-hint';
+  hint.textContent = '눌러서 고치기';
+
+  const noteBox = document.createElement('div');
+  noteBox.className = 'note-text';
+  noteBox.contentEditable = 'true';
+  noteBox.textContent = mark.dataset.note;
+  noteBox.onkeydown = (key) => {
+    if (key.key === 'Escape') { noteBox.textContent = mark.dataset.note; noteBox.blur(); }
+    else if (key.key === 'Enter' && (key.ctrlKey || key.metaKey)) {
+      key.preventDefault();
+      noteBox.blur();
+    }
+  };
+  noteBox.onblur = async () => {
+    const next = noteBox.textContent.trim();
+    if (!next || next === mark.dataset.note) { noteBox.textContent = mark.dataset.note; return; }
+    const done = await post('/note/edit',
+      {ref: noteBubble.dataset.ref, quote: mark.textContent, note: next});
+    if (done) { mark.dataset.note = next; hint.textContent = '고쳤습니다'; }
+    else { noteBox.textContent = mark.dataset.note; }
+  };
+  noteCard.appendChild(noteBox);
+  const drop = document.createElement('button');
+  drop.className = 'drop-note';
+  drop.textContent = '메모 지우기';
+  drop.onclick = async () => {
+    if (await post('/note/remove', {ref: noteBubble.dataset.ref, quote: mark.textContent})) {
+      location.reload();
+    }
+  };
+  const foot = document.createElement('div');
+  foot.className = 'note-foot';
+  foot.append(hint, drop);
+  noteCard.appendChild(foot);
+  const box = mark.getBoundingClientRect();
+  const room = innerWidth - box.right - 20;
+  noteCard.hidden = false;
+  noteCard.style.top = (box.top + scrollY) + 'px';
+  noteCard.style.left = room > 280
+    ? (box.right + scrollX + 12) + 'px'
+    : (Math.max(8, box.left + scrollX - 40)) + 'px';
+});
+
 const pageTools = document.getElementById('page-tools');
 if (pageTools) {
   document.getElementById('move').onclick =
@@ -2532,6 +2720,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.move_page()
         elif prefix == "delete":
             self.remove_page()
+        elif prefix == "note":
+            data = self.read_json()
+            ref = normalize_ref(data.get("ref", ""))
+            note = data.get("note", "").strip()
+            if not page_exists(ref):
+                self.send_text(400, "없는 문서입니다.")
+            elif rest == "remove":
+                self.reply(change_note(ref, data.get("quote", ""), None), ref)
+            elif not note:
+                self.send_text(400, "메모 내용을 적어 주세요.")
+            elif rest == "edit":
+                self.reply(change_note(ref, data.get("quote", ""), note), ref)
+            else:
+                self.reply(add_note(ref, data.get("quote", ""), note), ref)
         elif prefix == "order":
             self.save_order()
         elif prefix == "preview":
