@@ -227,7 +227,8 @@ def resolve_ref(ref: str) -> str:
     ref = normalize_ref(ref)
     if page_exists(ref):
         return ref
-    matches = scan()["titles"].get(ref, [])
+    # 링크가 옛 자리를 가리키더라도 같은 이름의 글이 하나뿐이면 그리로 보내 줍니다.
+    matches = scan()["titles"].get(title_of(ref), [])
     return matches[0] if len(matches) == 1 else ref
 
 
@@ -297,6 +298,32 @@ def move_children(old_ref: str, new_ref: str) -> bool:
     kids.rename(target)
     forget_scan()
     return True
+
+
+def relink(old_ref: str, new_ref: str) -> int:
+    """글이나 폴더가 자리를 옮기면 다른 글에 걸린 [[링크]]도 새 자리로 고칩니다."""
+    if old_ref == new_ref or not old_ref:
+        return 0
+
+    def swap(found: re.Match) -> str:
+        raw, bar, label = found.group(1).partition("|")
+        target = normalize_ref(raw)
+        if target == old_ref:
+            moved = new_ref
+        elif target.startswith(old_ref + "/"):      # 아래에 달린 글들도 같이 따라갑니다
+            moved = new_ref + target[len(old_ref):]
+        else:
+            return found.group(0)
+        return "[[" + moved + (bar + label if bar else "") + "]]"
+
+    fixed = 0
+    for ref, _ in list_pages():
+        text = read_page(ref)
+        changed = re.sub(WIKILINK_RE, swap, text)
+        if changed != text:
+            write_page(ref, changed)
+            fixed += 1
+    return fixed
 
 
 def list_pages() -> list[tuple[str, datetime]]:
@@ -437,7 +464,9 @@ def rename_folder(folder: str, to: str) -> tuple[bool, str]:
     target.parent.mkdir(parents=True, exist_ok=True)
     source.rename(target)
     forget_scan()
-    return True, f"‘{folder}’ 폴더를 ‘{to}’ 로 옮겼습니다."
+    moved = relink(folder, to)
+    tail = f" 링크 {moved}곳도 고쳤습니다." if moved else ""
+    return True, f"‘{folder}’ 폴더를 ‘{to}’ 로 옮겼습니다.{tail}"
 
 
 def delete_folder(folder: str) -> tuple[bool, str]:
@@ -2880,6 +2909,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_text(400, f"‘{ref}’ 아래에 이미 다른 글이 있어 옮기지 못했습니다.")
                 return
             delete_page(original)
+            relink(original, ref)
         self.send_json({"ref": ref})
 
     def move_page(self):
@@ -2908,6 +2938,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_text(400, f"‘{new_ref}’ 아래에 이미 다른 글이 있어 옮기지 못했습니다.")
                 return
             delete_page(ref)
+            relink(ref, new_ref)
         self.send_json({"ref": new_ref})
 
     def remove_page(self):
