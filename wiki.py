@@ -42,7 +42,6 @@ HOME = "홈"
 ORDER_FILE = ".order"
 DEFAULT_NAME = "위키"
 SEARCH_LIMIT = 50
-LIST_LIMIT = 200
 DEFAULT_PORT = 8800
 
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -912,7 +911,8 @@ img { max-width: 100%; border-radius: 6px; }
 }
 .btn:hover { border-color: var(--accent); color: var(--accent); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.danger:hover { border-color: var(--new); color: var(--new); }
+.btn.danger { color: var(--new); border-color: var(--new); }
+.btn.danger:hover { background: var(--new); border-color: var(--new); color: #fff; }
 .meta { color: var(--muted); font-size: 13px; }
 .crumbs { font-size: 14px; margin-bottom: 10px; }
 .crumbs a { text-decoration: none; }
@@ -1079,7 +1079,7 @@ def sidebar_rows(
                 f'<button class="twist" data-act="fold" style="margin-left:{indent}px" '
                 f'title="접기/펴기">{"▸" if folded else "▾"}</button>'
                 f'<a class="folder{state}" draggable="false" style="padding-left:2px" '
-                f'href="{folder_link(path)}">📁 {html.escape(name)}</a>'
+                f'href="#" data-fold="1" title="눌러서 접기/펴기">📁 {html.escape(name)}</a>'
                 '<span class="acts">'
                 '<button data-act="write" title="이 폴더에 새 글">📄</button>'
                 '<button data-act="add" title="하위 폴더 추가">＋</button>'
@@ -1173,13 +1173,6 @@ async function removeFolder(folder) {
   if (await post('/folder/delete', {folder: folder})) { goFolder(''); }
 }
 
-async function movePage(ref, folder) {
-  const to = prompt('옮길 폴더 경로를 넣어 주세요. 비워 두면 폴더 없이 옮깁니다.', folder);
-  if (to === null) { return; }
-  const moved = await post('/move', {ref: ref, folder: to});
-  if (moved) { location.href = '/w/' + encodeURIComponent(moved.ref); }
-}
-
 async function renamePage(ref, title) {
   const to = prompt('글 제목을 고쳐 주세요.', title);
   if (!to || to === title) { return; }
@@ -1240,6 +1233,12 @@ document.getElementById('side-sort').onchange = (e) => {
   location.reload();
 };
 aside.onclick = (e) => {
+  const foldLink = e.target.closest('a[data-fold]');   // 폴더 이름을 눌러도 접고 폅니다
+  if (foldLink) {
+    e.preventDefault();
+    toggleFolder(foldLink.closest('.item'));
+    return;
+  }
   const button = e.target.closest('button[data-act]');
   if (!button) { return; }
   const item = button.closest('.item');
@@ -1439,10 +1438,6 @@ if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide
     return page.encode("utf-8")
 
 
-def folder_link(folder: str) -> str:
-    return "/?folder=" + urllib.parse.quote(folder)
-
-
 def home_link() -> str:
     home = home_page()
     return f"/w/{urllib.parse.quote(home)}" if home else "/"
@@ -1454,12 +1449,21 @@ def home_title() -> str:
 
 
 def crumbs(folder: str) -> str:
-    trail = ['<a href="/">문서 목록</a>']
-    parts = folder.split("/") if folder else []
-    for depth, part in enumerate(parts, start=1):
-        path = "/".join(parts[:depth])
-        trail.append(f'<a href="{folder_link(path)}">{html.escape(part)}</a>')
-    return '<div class="crumbs">' + " / ".join(trail) + "</div>"
+    """이 글이 어느 폴더에 있는지 알려 줍니다. 폴더는 왼쪽 목록에서 찾습니다."""
+    if not folder:
+        return ""
+    return f'<div class="crumbs meta">📁 {html.escape(folder)}</div>'
+
+
+def start_body() -> str:
+    """홈으로 정한 글이 없을 때 보여 주는 첫 화면."""
+    if not list_pages():
+        return ('<h1>새 위키</h1><p class="empty">아직 글이 없습니다. '
+                '왼쪽 목록의 <b>＋ 글</b> 로 시작해 보세요.</p>')
+    return ("<h1>어디로 갈까요</h1>"
+            '<p class="empty">왼쪽 목록에서 글을 고르세요.<br>'
+            '자주 여는 글은 <a href="/settings">설정</a> 의 '
+            "<b>홈으로 쓸 글</b> 로 정해 두면 여기서 바로 열립니다.</p>")
 
 
 def entry_rows(
@@ -1469,7 +1473,7 @@ def entry_rows(
     for ref, when, snippets in entries:
         folder = folder_of(ref)
         where = (
-            f'<div class="meta">📁 <a href="{folder_link(folder)}">{html.escape(folder)}</a></div>'
+            f'<div class="meta">📁 {html.escape(folder)}</div>'
             if show_folder and folder else ""
         )
         snippet_html = "".join(
@@ -1482,27 +1486,10 @@ def entry_rows(
             '<span class="acts">'
             f'<a class="btn" href="/e/{urllib.parse.quote(ref)}">고치기</a>'
             '<button class="btn" data-row="rename">제목</button>'
-            '<button class="btn" data-row="remove">삭제</button></span>'
+            '<button class="btn danger" data-row="remove">삭제</button></span>'
             f'<span class="meta">{when:%Y-%m-%d %H:%M}</span></div>{snippet_html}</li>'
         )
     return f'<ul class="list">{"".join(rows)}</ul>'
-
-
-def grouped_rows(pages: list[tuple[str, datetime]]) -> str:
-    groups: dict[str, list] = {}
-    for ref, when in pages:
-        groups.setdefault(folder_of(ref), []).append((ref, when, []))
-    blocks = []
-    for folder in groups:
-        label = f"📁 {html.escape(folder)}" if folder else "폴더 없음"
-        name = f'<a href="{folder_link(folder)}">{label}</a>' if folder else label
-        blocks.append(
-            f'<div class="group" data-folder="{html.escape(folder, quote=True)}">'
-            f'<h2><button class="twist" data-fold="1" title="접기/펴기">▾</button>'
-            f'{name} <span class="meta">{len(groups[folder])}개</span></h2>'
-            f"{entry_rows(groups[folder])}</div>"
-        )
-    return "".join(blocks)
 
 
 SORTS = [
@@ -1511,19 +1498,6 @@ SORTS = [
     ("old", "오래전에 고친 순"),
     ("name", "이름 순"),
 ]
-
-
-def sorted_pages(folder: str, sort: str) -> list[tuple[str, datetime]]:
-    changed = dict(list_pages())
-    if sort == "recent":
-        pages = sorted(changed.items(), key=lambda item: item[1], reverse=True)
-    elif sort == "old":
-        pages = sorted(changed.items(), key=lambda item: item[1])
-    elif sort == "name":
-        pages = sorted(changed.items(), key=lambda item: title_of(item[0]).casefold())
-    else:
-        pages = [(ref, changed[ref]) for ref in ordered_refs()]
-    return [item for item in pages if in_folder(item[0], folder)]
 
 
 def page_links(params: dict, page: int, total: int, size: int) -> str:
@@ -1544,51 +1518,6 @@ def page_links(params: dict, page: int, total: int, size: int) -> str:
         f'<span class="meta">{first}–{min(page * size, total)} / {total}개 '
         f"({page}/{last} 쪽)</span>{link(page + 1, '다음 →')}</div>"
     )
-
-
-def index_body(folder: str, sort: str = "order", page: int = 1) -> str:
-    pages = sorted_pages(folder, sort)
-    quoted = urllib.parse.quote(folder)
-    heading = (
-        f'<h1>📁 {html.escape(folder)} <span class="meta">({len(pages)}개)</span></h1>' if folder
-        else f'<h1>문서 목록 <span class="meta">({len(pages)}개)</span></h1>'
-    )
-    tools = [
-        f'<a class="btn primary" href="/new{f"?folder={quoted}" if folder else ""}">새 글</a>',
-        f'<button class="btn" id="create">{"하위 폴더" if folder else "폴더"} 추가</button>',
-    ]
-    if folder:
-        tools.append('<button class="btn" id="rename">폴더 이름 바꾸기</button>')
-        tools.append('<button class="btn" id="remove">폴더 삭제</button>')
-    toolbar = (
-        f'<div class="toolbar" id="folder-tools" '
-        f'data-folder="{html.escape(folder, quote=True)}">{"".join(tools)}</div>'
-    )
-    if not pages:
-        target = f"/new?folder={quoted}" if folder else "/new"
-        listing = (
-            f'<p class="empty">아직 문서가 없습니다. <a href="{target}">글을 써 보세요.</a></p>'
-        )
-    else:
-        page = max(1, min(page, (len(pages) + LIST_LIMIT - 1) // LIST_LIMIT))
-        shown = pages[(page - 1) * LIST_LIMIT:page * LIST_LIMIT]
-        params = {"folder": folder, "sort": sort} if folder else {"sort": sort}
-        # 순서를 직접 정했을 때만 폴더별로 묶고, 그 밖에는 고른 기준대로 한 줄로 세웁니다.
-        rows = (
-            grouped_rows(shown) if sort == "order"
-            else entry_rows([(ref, when, []) for ref, when in shown], show_folder=True)
-        )
-        listing = rows + page_links(params, page, len(pages), LIST_LIMIT)
-    choices = "".join(
-        f'<option value="{key}"{" selected" if key == sort else ""}>{label}</option>'
-        for key, label in SORTS
-    )
-    picker = (
-        f'<div class="toolbar"><label class="meta" for="sort">정렬</label>'
-        f'<select id="sort" data-folder="{html.escape(folder, quote=True)}">{choices}</select>'
-        "</div>"
-    )
-    return f"{crumbs(folder) if folder else ''}{heading}{toolbar}{picker}{listing}"
 
 
 LIST_SCRIPT = """
@@ -1627,26 +1556,6 @@ document.querySelector('main').addEventListener('click', (e) => {
 });
 """
 
-INDEX_SCRIPT = LIST_SCRIPT + """
-const openFolder = document.getElementById('folder-tools').dataset.folder;
-const sortPicker = document.getElementById('sort');
-if (sortPicker) {
-  sortPicker.onchange = () => {
-    const params = new URLSearchParams();
-    if (openFolder) { params.set('folder', openFolder); }
-    params.set('sort', sortPicker.value);
-    location.href = '/?' + params;
-  };
-}
-document.getElementById('create').onclick = () => createFolder(openFolder);
-const renameButton = document.getElementById('rename');
-if (renameButton) {
-  renameButton.onclick = () => renameFolder(openFolder);
-  document.getElementById('remove').onclick = () => removeFolder(openFolder);
-}
-"""
-
-
 def search_body(query: str, page: int = 1) -> str:
     if not query:
         return '<h1>검색</h1><p class="empty">위쪽 검색창에 찾을 말을 넣어 주세요.</p>'
@@ -1682,7 +1591,6 @@ def view_body(ref: str) -> str:
         f'<span class="meta">마지막 수정 {when:%Y-%m-%d %H:%M}</span>'
         f'<span class="spacer"></span>'
         f'<button class="btn danger" id="remove">삭제</button>'
-        f'<button class="btn" id="move">폴더 이동</button>'
         f'<a class="btn" href="/new?folder={quoted}">아래에 새 글</a>'
         f'<a class="btn primary" href="/e/{quoted}">글 수정</a></div>'
         f"<h1>{html.escape(title_of(ref))}</h1>{render(read_page(ref))}"
@@ -1704,7 +1612,7 @@ def children_list(ref: str) -> str:
         path = f"{ref}/{name}"
         if is_folder:
             rows.append(
-                f'<li><div class="row"><a href="{folder_link(path)}">📁 {html.escape(name)}</a>'
+                f'<li><div class="row"><span class="meta">📁 {html.escape(name)}</span>'
                 "</div></li>"
             )
         else:
@@ -1817,8 +1725,6 @@ readArea.addEventListener('click', (e) => {
 
 const pageTools = document.getElementById('page-tools');
 if (pageTools) {
-  document.getElementById('move').onclick =
-    () => movePage(pageTools.dataset.ref, pageTools.dataset.folder);
   document.getElementById('remove').onclick = async () => {
     if (!confirm('‘' + pageTools.dataset.ref + '’ 글을 지울까요? 되돌릴 수 없습니다.')) { return; }
     const removed = await post('/delete', {ref: pageTools.dataset.ref});
@@ -2793,6 +2699,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def redirect(self, where: str):
+        self.send_response(303)
+        self.send_header("Location", where)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def send_text(self, status: int, message: str):
         self.send(message.encode("utf-8"), status, "text/plain; charset=utf-8")
 
@@ -2840,14 +2753,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         side = self.side_sort()
 
         if prefix == "":
-            folder = normalize_ref(query.get("folder", [""])[0])
-            sort = query.get("sort", ["order"])[0]
-            sort = sort if sort in dict(SORTS) else "order"
-            page = self.page_number(query)
-            self.send(shell(
-                f"문서 목록 - {name}", index_body(folder, sort, page), INDEX_SCRIPT,
-                current_folder=folder, closed=closed, side_sort=side,
-            ))
+            # 글 목록은 왼쪽 목록이 대신하므로, 맨 앞 주소는 홈으로 정한 글을 엽니다.
+            if home_page():
+                self.redirect("/w/" + urllib.parse.quote(home_page()))
+                return
+            self.send(shell(name, start_body(), closed=closed, side_sort=side))
         elif prefix == "new":
             folder = normalize_ref(query.get("folder", [""])[0])
             self.send(shell(f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT, closed=closed, side_sort=side))
