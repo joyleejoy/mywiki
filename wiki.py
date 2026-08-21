@@ -629,9 +629,11 @@ BLOCK_START = re.compile(r"^\s*(?:[-*+] |\d+[.)] |\|)")
 
 
 def loosen(text: str) -> str:
-    """문단 바로 아래에 붙여 쓴 목록·표·코드블록도 블록으로 인식되도록 빈 줄을 넣습니다."""
+    """문단 바로 아래에 붙여 쓴 목록·표·코드블록도 블록으로 인식되도록 빈 줄을 넣습니다.
+    빈 줄을 여럿 두면 마크다운은 하나로 합치므로, 누른 Enter 만큼 실제로 띄워 보이게 합니다."""
     lines = []
     fenced = False
+    blanks = 0
     for line in text.split("\n"):
         starts_block = BLOCK_START.match(line) or line.lstrip().startswith("```")
         if not fenced and starts_block and lines and lines[-1].strip():
@@ -639,6 +641,16 @@ def loosen(text: str) -> str:
                 lines.append("")
         if line.lstrip().startswith("```"):
             fenced = not fenced
+        if not fenced and not line.strip():
+            blanks += 1
+            # 첫 빈 줄은 문단을 나누고, 그 뒤로 이어지는 빈 줄은 한 줄씩 띄웁니다.
+            # <br> 앞뒤를 빈 줄로 감싸야 옆 문단에 붙지 않고 한 줄로 남습니다.
+            if blanks > 1 and any(kept.strip() for kept in lines):
+                lines.append("<br>")
+                lines.append("")
+                continue
+        elif not fenced:
+            blanks = 0
         lines.append(line)
     return "\n".join(lines)
 
@@ -664,7 +676,7 @@ class MarkdownWriter(HTMLParser):
         self.quote = 0
         self.pre = 0
         self.skip = 0
-        self.link: list[str] = []            # 링크 여는 태그 정보
+        self.link: list[tuple] = []          # 링크 여는 태그 정보 (종류, 가리키는 곳, 글자 시작 자리)
         self.cells: list[str] | None = None  # 표 한 줄
         self.fence_at: int | None = None     # 코드블록 여는 줄 자리 (언어 이름을 나중에 채움)
         self.note: str | None = None         # 메모 표시 안에 있는 동안 담아 두는 메모 내용
@@ -706,7 +718,12 @@ class MarkdownWriter(HTMLParser):
                 self.table_width = 0
             self.flush(blank=tag in ("p", "div", "table"))
         elif tag == "br":
-            self.flush()
+            if self.cells is not None:
+                self.add(" ")   # 표 칸 안에서 줄을 나누면 표가 깨집니다
+            elif not self.line and not self.lists and not self.quote:
+                self.out.append("")   # Enter 만 누른 빈 줄은 그대로 남깁니다
+            else:
+                self.flush()
         elif tag == "hr":
             self.flush(blank=True)
             self.out.append("---")
@@ -738,12 +755,10 @@ class MarkdownWriter(HTMLParser):
         elif tag == "a":
             wiki = values.get("data-wiki")
             if wiki is not None:
-                # 위키 링크는 화면에 보이는 글자 대신 원래 적은 내용을 그대로 되살립니다.
-                self.add(f"[[{wiki}]]")
-                self.link.append(None)
-                self.skip += 1
+                # 위키 링크는 가리키는 글만 지켜 두고, 보이는 글자는 화면에서 고친 대로 씁니다.
+                self.link.append(("wiki", wiki.partition("|")[0], len(self.line)))
             else:
-                self.link.append(values.get("href", ""))
+                self.link.append(("url", values.get("href", ""), 0))
                 self.add("[")
         elif tag == "span" and "data-note" in values:
             self.add("{{")
@@ -785,11 +800,14 @@ class MarkdownWriter(HTMLParser):
             self.quote = max(0, self.quote - 1)
             self.flush(blank=True)
         elif tag == "a" and self.link:
-            target = self.link.pop()
-            if target is None:
-                self.skip = max(0, self.skip - 1)
-            else:
+            kind, target, at = self.link.pop()
+            if kind != "wiki":
                 self.add(f"]({target})")
+                return
+            shown = self.line[at:].strip()   # 화면에서 고친 링크 글자
+            self.line = self.line[:at]
+            self.add(f"[[{target}]]" if not shown or shown == target
+                     else f"[[{target}|{shown}]]")
         elif tag == "span" and self.note is not None:
             self.add("||" + self.note + "}}")
             self.note = None
@@ -798,9 +816,10 @@ class MarkdownWriter(HTMLParser):
             self.line = ""
         elif tag == "tr" and self.cells is not None:
             cells = self.cells or [""]
-            self.out.append("| " + " | ".join(cell or " " for cell in cells) + " |")
+            # 칸 속에 공백을 두지 않습니다. 파이프 사이에 그 칸 내용만 들어갑니다.
+            self.out.append("|" + "|".join(cells) + "|")
             if self.table_head:
-                self.out.append("| " + " | ".join("---" for _ in cells) + " |")
+                self.out.append("|" + "|".join("---" for _ in cells) + "|")
                 self.table_head = False
             self.cells = None
         elif tag == "table":
@@ -816,7 +835,9 @@ class MarkdownWriter(HTMLParser):
                     self.flush()
                 self.add(piece)
             return
-        text = re.sub(r"[ \t]*\n[ \t]*", " ", data.replace("\xa0", " "))
+        # 폭 없는 공백(U+200B)은 링크 글자를 고칠 때 자리만 잡아 두는 글자라 저장하지 않습니다.
+        clean = data.replace("\xa0", " ").replace("\u200b", "")
+        text = re.sub(r"[ \t]*\n[ \t]*", " ", clean)
         if not text.strip() and not self.line:
             return
         self.add(text)
@@ -1008,8 +1029,13 @@ img { max-width: 100%; border-radius: 6px; }
 #grid input:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
 #grid tr:first-child input { font-weight: 700; background: var(--card); }
 #link-modal .sheet { width: min(680px, 92vw); }
-#link-folder { width: 34%; font-size: 15px; color: var(--muted); }
-#link-title { flex: 1; font-size: 18px; font-weight: 700; }
+#link-folder { width: 100%; font-size: 15px; color: var(--muted); margin-top: 8px; }
+#link-title { width: 100%; font-size: 18px; font-weight: 700; }
+#link-new { margin-top: 4px; }
+#link-pick {
+  width: 100%; padding: 9px 12px; font-size: 16px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--bg); color: var(--fg);
+}
 #link-folder, #link-title {
   padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--bg); color: var(--fg); min-width: 0;
@@ -1619,9 +1645,9 @@ def view_body(ref: str) -> str:
         f'data-folder="{html.escape(folder, quote=True)}">'
         f'<span class="meta">마지막 수정 {when:%Y-%m-%d %H:%M}</span>'
         f'<span class="spacer"></span>'
-        f'<button class="btn danger" id="remove">삭제</button>'
+        f'<a class="btn primary" href="/e/{quoted}">글 수정</a>'
         f'<a class="btn" href="/new?folder={quoted}">아래에 새 글</a>'
-        f'<a class="btn primary" href="/e/{quoted}">글 수정</a></div>'
+        f'<button class="btn danger" id="remove">삭제</button></div>'
         f"<h1>{html.escape(title_of(ref))}</h1>{render(read_page(ref))}"
         f"{children_list(ref)}"
         f'<button class="btn primary" id="note-bubble" '
@@ -1769,13 +1795,13 @@ MD_BUTTONS = [
     ("기울임", 'data-wrap="*" data-hint="기울인 글씨" data-rich="italic"'),
     ("코드", 'data-wrap="`" data-hint="코드"'),
     ("목록", 'data-prefix="- " data-rich="insertUnorderedList"'),
+    ("숫자 목록", 'data-prefix="1. " data-rich="insertOrderedList"'),
     ("인용", 'data-prefix="&gt; " data-rich="formatBlock:blockquote"'),
     ("링크", 'data-snippet="[보일 글자](https://)"'),
     ("내 PC 파일", 'data-local="1" data-rich="local"'),
-    ("문서 링크", 'data-snippet="[[문서 이름]]"'),
+    ("글 연결", 'data-connect="1" data-rich="connect"'),
     ("표", 'data-table="1" data-rich="table"'),
     ("그림", 'data-draw="1" data-rich="draw"'),
-    ("새 글로 연결", 'data-extract="1" data-rich="extract"'),
 ]
 
 CODE_LANGS = [
@@ -1815,45 +1841,81 @@ function wrapSelection(mark, hint) {
   typeText(mark + (selected || hint) + mark);
 }
 
-function prefixLine(prefix) {
-  const start = editor.value.lastIndexOf('\\n', editor.selectionStart - 1) + 1;
-  editor.setSelectionRange(start, start);
-  typeText(prefix);
+// 표·코드블록은 줄 맨 앞에서 시작해야 마크다운이 덩어리로 알아봅니다.
+// 커서가 글 가운데 있으면 줄을 먼저 바꾸고, 뒤에 남은 글도 다음 줄로 내려 보냅니다.
+function typeBlock(text) {
+  const here = lineHere();
+  const ahead = editor.value.slice(editor.selectionStart, here.end);
+  const above = editor.value.slice(0, here.start).replace(/\\n$/, '');
+  let head = '';
+  if (here.text.trim()) { head = '\\n\\n'; }
+  else if (above.slice(above.lastIndexOf('\\n') + 1).trim()) { head = '\\n'; }
+  typeText(head + text + (ahead.trim() ? '\\n' : ''));
 }
 
-// 고른 글자는 그대로 두고 링크만 걸면서, 이어질 새 글을 만듭니다.
+// 창(표·그림)을 열면 서식 편집 커서 자리를 잃어버립니다. 열 때 기억해 두고 넣을 때 되살립니다.
+let richSpot = null;
+
+function keepRichSpot() {
+  const chosen = document.getSelection();
+  richSpot = (richMode && chosen.rangeCount && rich.contains(chosen.anchorNode))
+    ? chosen.getRangeAt(0).cloneRange() : null;
+}
+
+function focusRichSpot() {
+  rich.focus();
+  if (!richSpot) { return; }
+  const chosen = document.getSelection();
+  chosen.removeAllRanges();
+  chosen.addRange(richSpot);
+}
+
+function prefixLine(prefix) {
+  const here = lineHere();
+  editor.setSelectionRange(here.start, here.start);
+  typeText(prefix);
+  // 커서를 줄 끝으로 보냅니다. 표시 뒤에 두면 이어 쓴 글자와 Enter 가 엉뚱한 자리로 갑니다.
+  const at = here.end + prefix.length;
+  editor.setSelectionRange(at, at);
+}
+
+// 글 연결: 목록에서 글을 골라 링크를 겁니다. ‘＋ 새 글 만들기’ 를 고르면 새 글을 만들어 연결합니다.
 const linkModal = document.getElementById('link-modal');
+const linkPick = document.getElementById('link-pick');
 const linkFolder = document.getElementById('link-folder');
 const linkTitle = document.getElementById('link-title');
 const linkBody = document.getElementById('link-text');
-let linkRange = null;   // 서식 편집 모드에서 고른 자리
+const linkNew = document.getElementById('link-new');
+const linkMake = document.getElementById('link-make');
 let linkSpan = null;    // 마크다운 모드에서 고른 자리
 let linkLabel = '';     // 고른 글자 (링크에 보일 글자)
 
-function extractToPage() {
+// 새 글 만들기를 골랐을 때만 제목·폴더·내용 칸을 보여 줍니다.
+function showLinkMode() {
+  linkNew.hidden = linkPick.value !== '+';
+}
+
+function openLink() {
   if (richMode) {
-    const chosen = document.getSelection();
-    if (!chosen.rangeCount || chosen.isCollapsed) {
-      status.textContent = '링크를 걸 글자를 먼저 골라 주세요.';
-      return;
-    }
-    linkRange = chosen.getRangeAt(0).cloneRange();
-    linkLabel = String(chosen);
+    keepRichSpot();
+    linkLabel = String(document.getSelection()).trim();
   } else {
-    if (editor.selectionStart === editor.selectionEnd) {
-      status.textContent = '링크를 걸 글자를 먼저 골라 주세요.';
-      return;
-    }
     linkSpan = {start: editor.selectionStart, end: editor.selectionEnd};
-    linkLabel = editor.value.slice(linkSpan.start, linkSpan.end);
+    linkLabel = editor.value.slice(linkSpan.start, linkSpan.end).trim();
   }
-  document.getElementById('link-label').textContent = '고른 글자: ' + linkLabel.trim();
+  document.getElementById('link-label').textContent = linkLabel
+    ? '‘' + linkLabel + '’ 에 링크를 겁니다.'
+    : '고른 글자가 없어 글 제목이 그대로 보입니다.';
+  // 고른 글자가 글 제목과 같으면 그 글을, 아니면 목록 첫 글을 미리 골라 둡니다.
+  const pages = [...linkPick.options].filter((option) => option.value !== '+');
+  const same = pages.find((option) => option.value.toLowerCase() === linkLabel.toLowerCase());
+  linkPick.value = same ? same.value : (pages.length ? pages[0].value : '+');
   linkFolder.value = folderInput.value.trim();
-  linkTitle.value = linkLabel.trim().slice(0, 100);
+  linkTitle.value = linkLabel.slice(0, 100);
   linkBody.value = '';
+  showLinkMode();
   linkModal.hidden = false;
-  linkTitle.focus();
-  linkTitle.select();
+  linkPick.focus();
 }
 
 function closeLinkModal() {
@@ -1861,35 +1923,62 @@ function closeLinkModal() {
   (richMode ? rich : editor).focus();
 }
 
-document.getElementById('link-make').onclick = async () => {
-  const title = linkTitle.value.trim();
+function putLink(ref) {
+  const label = (linkLabel && linkLabel !== ref) ? linkLabel : '';
+  const inner = label ? ref + '|' + label : ref;
+  if (richMode) {
+    focusRichSpot();
+    const safe = (label || ref).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    document.execCommand('insertHTML', false,
+      '<a data-wiki="' + inner.replace(/"/g, '&quot;') + '" '
+      + 'href="/w/' + encodeURIComponent(ref) + '">' + safe + '</a>');
+  } else {
+    editor.focus();
+    editor.setSelectionRange(linkSpan.start, linkSpan.end);
+    typeText('[[' + inner + ']]');
+  }
+}
+
+linkPick.addEventListener('change', () => {
+  showLinkMode();
+  if (linkPick.value === '+') { linkTitle.focus(); linkTitle.select(); }
+});
+
+linkMake.onclick = async () => {
+  if (!linkPick.value) {
+    document.getElementById('link-label').textContent = '연결할 글을 목록에서 골라 주세요.';
+    linkPick.focus();
+    return;
+  }
+  if (linkPick.value !== '+') {          // 이미 있는 글에 연결
+    const ref = linkPick.value;
+    closeLinkModal();
+    putLink(ref);
+    status.textContent = '‘' + ref + '’ 로 링크를 걸었습니다.';
+    return;
+  }
+  const title = linkTitle.value.trim();  // 새 글을 만들어 연결
   if (!title) { linkTitle.focus(); return; }
   const saved = await post('/save', {
     original: '', folder: linkFolder.value.trim(), title: title, text: linkBody.value,
   });
   if (!saved) { return; }
-  const ref = saved.ref;
-  const label = linkLabel;
-  linkModal.hidden = true;
-  if (richMode) {
-    const chosen = document.getSelection();
-    chosen.removeAllRanges();
-    chosen.addRange(linkRange);
-    rich.focus();
-    const safe = label.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-    document.execCommand('insertHTML', false,
-      '<a data-wiki="' + ref + '|' + label + '" href="/w/' + encodeURIComponent(ref) + '">'
-      + safe + '</a>');
-  } else {
-    editor.focus();
-    editor.setSelectionRange(linkSpan.start, linkSpan.end);
-    typeText(ref === label ? '[[' + label + ']]' : '[[' + ref + '|' + label + ']]');
-  }
-  status.textContent = '‘' + ref + '’ 를 만들고 링크를 걸었습니다. 이 글도 저장해 주세요.';
+  const fresh = document.createElement('option');   // 만든 글을 목록에도 넣어 둡니다
+  fresh.value = saved.ref;
+  fresh.textContent = saved.ref;
+  linkPick.appendChild(fresh);
+  closeLinkModal();
+  putLink(saved.ref);
+  status.textContent = '‘' + saved.ref + '’ 를 만들고 링크를 걸었습니다. 이 글도 저장해 주세요.';
 };
 
 document.getElementById('link-cancel').onclick = closeLinkModal;
 linkModal.onclick = (e) => { if (e.target === linkModal) { closeLinkModal(); } };
+for (const box of [linkPick, linkTitle, linkFolder]) {
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); linkMake.click(); }
+  });
+}
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !linkModal.hidden) { closeLinkModal(); }
 });
@@ -1929,7 +2018,8 @@ function insertCodeBlock(toRich) {
   }
   const chosen = editor.value.slice(editor.selectionStart, editor.selectionEnd);
   const body = chosen.replace(/\\n+$/, '') || '여기에 코드를 씁니다';
-  typeText('```' + lang + '\\n' + body + '\\n```\\n');
+  if (chosen) { typeText('```' + lang + '\\n' + body + '\\n```\\n'); }
+  else { typeBlock('```' + lang + '\\n' + body + '\\n```\\n'); }
 }
 
 async function save(leave) {
@@ -1977,6 +2067,25 @@ async function upload(files) {
 document.getElementById('save').onclick = () => save(false);
 document.getElementById('done').onclick = () => save(true);
 document.getElementById('picker').onchange = (e) => upload(e.target.files);
+// 크롬은 줄 모양을 바꾸면(목록·제목·인용) 커서를 줄 맨 앞으로 되돌려 놓습니다.
+// 그대로 두면 이어 쓴 글자가 앞에 끼어들고 Enter 는 빈 항목만 만듭니다.
+const BLOCK_COMMANDS = ['insertUnorderedList', 'insertOrderedList', 'formatBlock'];
+const BLOCKS = 'li, h1, h2, h3, h4, h5, h6, blockquote, p, div';
+
+function caretToLineEnd() {
+  const chosen = document.getSelection();
+  let node = chosen.anchorNode;
+  if (!node) { return; }
+  if (node.nodeType === 3) { node = node.parentNode; }
+  const line = node.closest(BLOCKS);
+  if (!line || !rich.contains(line)) { return; }
+  const range = document.createRange();
+  range.selectNodeContents(line);
+  range.collapse(false);
+  chosen.removeAllRanges();
+  chosen.addRange(range);
+}
+
 mdbar.querySelectorAll('button').forEach((button) => {
   button.onclick = () => {
     const data = button.dataset;
@@ -1985,9 +2094,14 @@ mdbar.querySelectorAll('button').forEach((button) => {
       if (command === 'table') { openTable(); }
       else if (command === 'draw') { openDraw(null); }
       else if (command === 'code') { insertCodeBlock(true); }
-      else if (command === 'extract') { extractToPage(); }
+      else if (command === 'connect') { openLink(); }
       else if (command === 'local') { insertLocalLink(); }
-      else { rich.focus(); document.execCommand(command, false, value); }
+      else {
+        rich.focus();
+        const wasCaret = document.getSelection().isCollapsed;
+        document.execCommand(command, false, value);
+        if (wasCaret && BLOCK_COMMANDS.includes(command)) { caretToLineEnd(); }
+      }
       return;
     }
     if (data.wrap) { wrapSelection(data.wrap, data.hint); }
@@ -1995,7 +2109,7 @@ mdbar.querySelectorAll('button').forEach((button) => {
     else if (data.table) { openTable(); }
     else if (data.draw) { openDraw(null); }
     else if (data.code) { insertCodeBlock(false); }
-    else if (data.extract) { extractToPage(); }
+    else if (data.connect) { openLink(); }
     else if (data.local) { insertLocalLink(); }
     else { typeText(data.snippet); }
   };
@@ -2026,7 +2140,37 @@ function drawGrid() {
   }
 }
 
+// 격자에서 화살표로 칸 사이를 오갑니다. 위아래는 바로, 좌우는 글자 끝에 닿으면 넘어갑니다.
+function focusCell(row, col, at) {
+  const line = grid.rows[row];
+  const cell = line && line.cells[col];
+  if (!cell) { return false; }
+  const input = cell.firstChild;
+  input.focus();
+  const spot = at === 'end' ? input.value.length : Math.min(at, input.value.length);
+  input.setSelectionRange(spot, spot);
+  return true;
+}
+
+grid.addEventListener('keydown', (e) => {
+  const input = e.target;
+  if (input.tagName !== 'INPUT' || e.ctrlKey || e.altKey || e.metaKey) { return; }
+  const row = input.parentNode.parentNode.rowIndex;
+  const col = input.parentNode.cellIndex;
+  const at = input.selectionStart;
+  const whole = input.selectionStart !== input.selectionEnd;
+  let moved = false;
+  if (e.key === 'ArrowUp') { moved = focusCell(row - 1, col, at); }
+  else if (e.key === 'ArrowDown') { moved = focusCell(row + 1, col, at); }
+  else if (e.key === 'ArrowLeft' && !whole && at === 0) { moved = focusCell(row, col - 1, 'end'); }
+  else if (e.key === 'ArrowRight' && !whole && at === input.value.length) {
+    moved = focusCell(row, col + 1, 0);
+  }
+  if (moved) { e.preventDefault(); }
+});
+
 function openTable() {
+  keepRichSpot();
   gridRows = 3;
   gridCols = 3;
   grid.innerHTML = '';
@@ -2040,11 +2184,12 @@ function closeTable() {
   (richMode ? rich : editor).focus();
 }
 
+// 칸 속에는 공백을 남기지 않습니다. 빈 칸은 빈 칸으로 그대로 둡니다.
 function tableMarkdown() {
-  const data = readGrid().map((row) => row.map((v) => v.trim().replace(/\\|/g, '\\\\|') || ' '));
-  const lines = ['| ' + data[0].join(' | ') + ' |',
-                 '| ' + data[0].map(() => '---').join(' | ') + ' |'];
-  for (const row of data.slice(1)) { lines.push('| ' + row.join(' | ') + ' |'); }
+  const data = readGrid().map((row) => row.map((v) => v.trim().replace(/\\|/g, '\\\\|')));
+  const lines = ['|' + data[0].join('|') + '|',
+                 '|' + data[0].map(() => '---').join('|') + '|'];
+  for (const row of data.slice(1)) { lines.push('|' + row.join('|') + '|'); }
   return lines.join('\\n') + '\\n';
 }
 
@@ -2060,8 +2205,9 @@ document.querySelectorAll('[data-grid]').forEach((button) => {
 });
 
 function tableHtml() {
-  const data = readGrid();
-  const cell = (v) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;') || '&nbsp;';
+  const data = readGrid().map((row) => row.map((v) => v.trim()));
+  // 빈 칸에는 공백 문자 대신 <br> 을 넣습니다. 공백을 넣으면 칸마다 지워야 할 글자가 남습니다.
+  const cell = (v) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;') || '<br>';
   const head = data[0].map((v) => '<th>' + cell(v) + '</th>').join('');
   const body = data.slice(1)
     .map((row) => '<tr>' + row.map((v) => '<td>' + cell(v) + '</td>').join('') + '</tr>')
@@ -2073,8 +2219,8 @@ document.getElementById('table-insert').onclick = () => {
   const markdown = tableMarkdown();
   const asHtml = tableHtml();
   closeTable();
-  if (richMode) { rich.focus(); document.execCommand('insertHTML', false, asHtml); }
-  else { typeText(markdown); }
+  if (richMode) { focusRichSpot(); document.execCommand('insertHTML', false, asHtml); }
+  else { typeBlock(markdown); }
 };
 document.getElementById('table-cancel').onclick = closeTable;
 tableModal.onclick = (e) => { if (e.target === tableModal) { closeTable(); } };
@@ -2336,6 +2482,7 @@ document.getElementById('draw-clear').onclick = () => {
 };
 
 async function openDraw(image) {
+  keepRichSpot();
   editingImage = image || null;
   shapes().forEach((node) => node.remove());
   pick([]);
@@ -2380,7 +2527,7 @@ document.getElementById('draw-insert').onclick = async () => {
     return;
   }
   if (richMode) {
-    rich.focus();
+    focusRichSpot();
     document.execCommand('insertHTML', false, '<img src="' + link + '" alt="' + saved.name + '">');
   } else {
     typeText('![' + saved.name + '](' + link + ')\\n');
@@ -2398,6 +2545,150 @@ document.addEventListener('keydown', (e) => {
     picked.forEach((node) => node.remove());
     pick([]);
   }
+});
+
+// 표 칸에 채워져 있는 공백(&nbsp;)을 지웁니다. 예전에 만든 표나 다른 곳에서 붙여넣은 표에는
+// 빈 칸마다 공백이 들어 있어, 누르고 바로 쓰면 글자 앞에 공백이 남습니다.
+function tidyCells() {
+  for (const cell of rich.querySelectorAll('td, th')) {
+    if (cell.querySelector('img')) { continue; }
+    if (!cell.textContent.replace(/[\\s\\u00a0]+/g, '')) {
+      if (cell.innerHTML !== '<br>') { cell.innerHTML = '<br>'; }
+      continue;
+    }
+    const texts = [...cell.childNodes].filter((node) => node.nodeType === 3);
+    for (const node of texts) { node.data = node.data.replace(/\\u00a0/g, ' '); }
+    if (texts.length) {   // 칸 앞뒤에 붙은 공백도 지웁니다
+      const first = texts[0];
+      const last = texts[texts.length - 1];
+      if (first === cell.firstChild) { first.data = first.data.replace(/^\\s+/, ''); }
+      if (last === cell.lastChild) { last.data = last.data.replace(/\\s+$/, ''); }
+    }
+  }
+}
+
+// 표 안에서는 화살표로 칸 사이를 오갑니다. 크롬은 표에서 위아래가 엉뚱한 칸으로 튑니다.
+function cellHere() {
+  const chosen = document.getSelection();
+  let node = chosen.anchorNode;
+  if (!node || !rich.contains(node)) { return null; }
+  if (node.nodeType === 3) { node = node.parentNode; }
+  return node.closest ? node.closest('td, th') : null;
+}
+
+function atCellEdge(cell, toEnd) {
+  const chosen = document.getSelection();
+  if (!chosen.isCollapsed || !chosen.rangeCount) { return false; }
+  const edge = document.createRange();
+  edge.selectNodeContents(cell);
+  edge.collapse(!toEnd);
+  return edge.compareBoundaryPoints(Range.START_TO_START, chosen.getRangeAt(0)) === 0;
+}
+
+function caretInto(node, toEnd) {
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  range.collapse(!toEnd);
+  const chosen = document.getSelection();
+  chosen.removeAllRanges();
+  chosen.addRange(range);
+}
+
+function goCell(cell, dr, dc, toEnd) {
+  const rows = [...cell.closest('table').rows];
+  const line = rows[rows.indexOf(cell.parentNode) + dr];
+  const target = line && line.cells[cell.cellIndex + dc];
+  if (!target) { return false; }
+  caretInto(target, toEnd);
+  return true;
+}
+
+// 맨 윗줄에서 위로, 맨 아랫줄에서 아래로 누르면 표 밖으로 나갑니다.
+// (크롬에 맡기면 표 안에서 옆 칸으로 튑니다.)
+function leaveTable(cell, down) {
+  const table = cell.closest('table');
+  const near = down ? table.nextElementSibling : table.previousElementSibling;
+  if (near && near.nodeName !== 'TABLE') { caretInto(near, !down); return true; }
+  const fresh = document.createElement('div');
+  fresh.appendChild(document.createElement('br'));
+  table.parentNode.insertBefore(fresh, down ? table.nextSibling : table);
+  caretInto(fresh, false);
+  return true;
+}
+
+// 링크 글자를 통째로 골라 다시 쓰면 크롬이 링크까지 지웁니다. 링크는 두고 글자만 바꿉니다.
+function wholeLinkChosen(range) {
+  const holder = (node) => (node && node.nodeType === 3 ? node.parentNode : node);
+  const from = holder(range.startContainer);
+  const to = holder(range.endContainer);
+  const link = from && from.closest ? from.closest('a[data-wiki]') : null;
+  if (!link || !to || !to.closest || to.closest('a[data-wiki]') !== link) { return null; }
+  const all = document.createRange();
+  all.selectNodeContents(link);
+  return (all.compareBoundaryPoints(Range.START_TO_START, range) === 0
+       && all.compareBoundaryPoints(Range.END_TO_END, range) === 0) ? link : null;
+}
+
+// 링크 끝에서 친 글자는 크롬이 링크 밖으로 내보냅니다. 그래서 보이지 않는 글자(폭 없는 공백)를
+// 뒤에 붙여 두고 그 앞에서 쓰게 합니다. 이 글자는 저장할 때 지워집니다.
+const KEEP = '\\u200b';
+
+function keepLinkAlive(link, first) {
+  link.textContent = first + KEEP;
+  const range = document.createRange();
+  range.setStart(link.firstChild, first.length);
+  range.collapse(true);
+  const chosen = document.getSelection();
+  chosen.removeAllRanges();
+  chosen.addRange(range);
+}
+
+function chosenWholeLink() {
+  const chosen = document.getSelection();
+  if (!chosen.rangeCount || chosen.isCollapsed) { return null; }
+  return wholeLinkChosen(chosen.getRangeAt(0));
+}
+
+rich.addEventListener('beforeinput', (e) => {
+  if (e.inputType !== 'insertText' || !e.data) { return; }
+  const link = chosenWholeLink();
+  if (!link) { return; }
+  e.preventDefault();
+  keepLinkAlive(link, e.data);
+});
+
+// 한글처럼 조합해서 넣는 입력은 막을 수 없습니다. 그래서 조합이 끝난 뒤 그 글자를 다시 링크로
+// 감싸 줍니다. 조합을 시작할 때 어느 글로 가는 링크였는지만 기억해 둡니다.
+let wasWholeLink = null;
+
+rich.addEventListener('compositionstart', () => {
+  const link = chosenWholeLink();
+  wasWholeLink = link ? (link.dataset.wiki || '').split('|')[0] : null;
+});
+
+rich.addEventListener('compositionend', (e) => {
+  const ref = wasWholeLink;
+  wasWholeLink = null;
+  if (!ref || !e.data) { return; }
+  const chosen = document.getSelection();
+  if (!chosen.rangeCount) { return; }
+  const at = chosen.getRangeAt(0);
+  const node = at.startContainer;
+  const end = at.startOffset;
+  const start = end - e.data.length;
+  if (node.nodeType !== 3 || start < 0 || node.data.slice(start, end) !== e.data) { return; }
+  const range = document.createRange();
+  range.setStart(node, start);
+  range.setEnd(node, end);
+  const link = document.createElement('a');
+  link.setAttribute('data-wiki', ref);
+  link.setAttribute('href', '/w/' + encodeURIComponent(ref));
+  range.surroundContents(link);
+  const after = document.createRange();
+  after.setStartAfter(link);
+  after.collapse(true);
+  chosen.removeAllRanges();
+  chosen.addRange(after);
 });
 
 // 서식 편집 모드에서 그림을 두 번 누르면 다시 고칠 수 있습니다.
@@ -2423,6 +2714,7 @@ async function setMode(toRich) {
     const shown = await post('/preview', {text: editor.value});
     if (!shown) { return; }
     rich.innerHTML = shown.html;
+    tidyCells();
   } else if (!await pullFromRich()) {
     return;
   }
@@ -2449,7 +2741,8 @@ document.addEventListener('keydown', (e) => {
 });
 for (const box of [titleInput, folderInput]) {
   box.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); editor.focus(); }
+    // 서식 편집 모드에서는 textarea 가 숨어 있어 focus() 가 통하지 않습니다.
+    if (e.key === 'Enter') { e.preventDefault(); (richMode ? rich : editor).focus(); }
   });
 }
 
@@ -2458,11 +2751,18 @@ const INDENT = '    ';
 
 function lineHere() {
   const start = editor.value.lastIndexOf('\\n', editor.selectionStart - 1) + 1;
-  return {start: start, text: editor.value.slice(start, editor.selectionStart)};
+  let end = editor.value.indexOf('\\n', editor.selectionStart);
+  if (end < 0) { end = editor.value.length; }
+  return {
+    start: start,
+    end: end,
+    text: editor.value.slice(start, editor.selectionStart),  // 커서 앞까지
+    full: editor.value.slice(start, end),                    // 줄 전체
+  };
 }
 
-function eraseBack(count) {
-  editor.setSelectionRange(editor.selectionStart - count, editor.selectionStart);
+function eraseLine(here) {
+  editor.setSelectionRange(here.start, here.end);
   document.execCommand('delete');
 }
 
@@ -2481,11 +2781,16 @@ editor.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey) { return; }
-  const found = lineHere().text.match(/^(\\s*)([-*+] |\\d+[.)] |> )(.*)$/);
+  // 줄 전체로 봅니다. 커서 앞만 보면 표시 바로 뒤에서 누른 Enter 가 빈 항목으로 보입니다.
+  const here = lineHere();
+  const found = here.full.match(/^(\\s*)([-*+] |\\d+[.)] |> )(.*)$/);
   if (!found) { return; }
+  if (editor.selectionStart < here.start + found[1].length + found[2].length) {
+    return;   // 표시 안에 커서가 있으면 그냥 줄을 바꿉니다
+  }
   e.preventDefault();
   if (!found[3].trim()) {
-    eraseBack(found[1].length + found[2].length);  // 빈 항목이면 목록을 끝냅니다
+    eraseLine(here);   // 빈 항목이면 표시를 지우고 목록을 끝냅니다
     typeText('\\n');
     return;
   }
@@ -2494,17 +2799,66 @@ editor.addEventListener('keydown', (e) => {
   typeText('\\n' + found[1] + marker);
 });
 
+// 크롬은 인용 안에서 Enter 를 눌러도 인용에서 빠져나오지 못합니다.
+// 목록처럼, 빈 인용 줄에서 Enter 를 누르면 인용을 끝내고 보통 줄로 나옵니다.
+function leaveQuote() {
+  const chosen = document.getSelection();
+  let node = chosen.anchorNode;
+  if (!node) { return false; }
+  if (node.nodeType === 3) { node = node.parentNode; }
+  const quote = node.closest('blockquote');
+  if (!quote || !rich.contains(quote)) { return false; }
+  const line = node.closest(BLOCKS) || quote;
+  if (line.textContent.trim() || line.querySelector('img')) { return false; }
+  let top = quote;   // 겹쳐 있으면 맨 바깥 인용 밖으로 나옵니다
+  for (let up = quote.parentNode; up && up !== rich; up = up.parentNode) {
+    if (up.nodeName === 'BLOCKQUOTE') { top = up; }
+  }
+  const fresh = document.createElement('div');
+  fresh.appendChild(document.createElement('br'));
+  top.parentNode.insertBefore(fresh, top.nextSibling);
+  line.remove();
+  if (!top.textContent.trim() && !top.querySelector('img')) { top.remove(); }
+  const range = document.createRange();
+  range.selectNodeContents(fresh);
+  range.collapse(false);
+  chosen.removeAllRanges();
+  chosen.addRange(range);
+  return true;
+}
+
 // 서식 편집 모드에서는 Tab 으로 목록 단계를 조절합니다.
 rich.addEventListener('keydown', (e) => {
   if (e.key === 'Tab') {
     e.preventDefault();
     document.execCommand(e.shiftKey ? 'outdent' : 'indent');
+    return;
   }
+  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && leaveQuote()) {
+    e.preventDefault();
+    return;
+  }
+  if (!e.key.startsWith('Arrow') || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) { return; }
+  const cell = cellHere();
+  if (!cell) { return; }
+  let moved = false;
+  if (e.key === 'ArrowUp') { moved = goCell(cell, -1, 0, true) || leaveTable(cell, false); }
+  else if (e.key === 'ArrowDown') { moved = goCell(cell, 1, 0, true) || leaveTable(cell, true); }
+  else if (e.key === 'ArrowLeft' && atCellEdge(cell, false)) { moved = goCell(cell, 0, -1, true); }
+  else if (e.key === 'ArrowRight' && atCellEdge(cell, true)) { moved = goCell(cell, 0, 1, false); }
+  if (moved) { e.preventDefault(); }   // 표 끝이면 그대로 둬서 표 밖으로 나갈 수 있게 합니다
 });
 for (const box of [editor, rich]) {
   box.addEventListener('paste', (e) => {
     const files = [...e.clipboardData.files];
-    if (files.length) { e.preventDefault(); upload(files); }
+    if (files.length) { e.preventDefault(); upload(files); return; }
+    if (box === rich) {   // 링크 글자를 통째로 골라 붙여넣어도 링크는 남깁니다
+      const link = chosenWholeLink();
+      const text = e.clipboardData.getData('text/plain');
+      if (link && text) { e.preventDefault(); keepLinkAlive(link, text.replace(/\\s+/g, ' ')); return; }
+    }
+    // 다른 곳에서 붙여넣은 표는 빈 칸이 공백으로 채워져 오므로 붙은 뒤에 지웁니다.
+    if (box === rich) { setTimeout(tidyCells, 0); }
   });
   box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('drag'); });
   box.addEventListener('dragleave', () => box.classList.remove('drag'));
@@ -2514,6 +2868,7 @@ for (const box of [editor, rich]) {
     if (e.dataTransfer.files.length) { upload(e.dataTransfer.files); }
   });
 }
+tidyCells();   // 열 때 이미 들어 있는 표의 공백부터 지웁니다
 (titleInput.value ? (richMode ? rich : editor) : titleInput).focus();
 """
 
@@ -2557,20 +2912,30 @@ def draw_modal() -> str:
     )
 
 
-def link_modal() -> str:
+def link_modal(ref: str) -> str:
+    """글 연결 창. 목록에서 글을 고르거나, 새 글을 만들어 연결합니다."""
+    options = "".join(
+        f'<option value="{html.escape(other, quote=True)}">{html.escape(other)}</option>'
+        for other in sorted(other for other, _ in list_pages() if other != ref)
+    )
     return (
         '<div class="modal" id="link-modal" hidden><div class="sheet">'
-        "<h2>새 글로 연결</h2>"
-        '<p class="hint">고른 글자는 그대로 두고 링크만 걸립니다. 이어질 새 글의 제목과 '
-        "내용을 여기서 정합니다. 내용은 비워 두고 나중에 채워도 됩니다.</p>"
-        '<div class="titlerow">'
-        '<input type="text" id="link-folder" placeholder="폴더 (비우면 맨 바깥)">'
+        "<h2>글 연결</h2>"
+        '<p class="hint">연결할 글을 목록에서 고르고 <b>연결</b> 을 누릅니다. '
+        '맨 위 <b>＋ 새 글 만들기</b> 를 고르면 새 글을 만들어 연결합니다. '
+        '고른 글자가 있으면 그 글자에 링크가 걸리고, 없으면 글 제목이 그대로 보입니다.</p>'
+        '<select id="link-pick">'
+        '<option value="+">＋ 새 글 만들기</option>'
+        f"{options}</select>"
+        '<div id="link-new" hidden>'
+        '<p class="hint">만들 글의 제목과 폴더를 정합니다. 내용은 안 써도 되고 나중에 채워도 됩니다.</p>'
         '<input type="text" id="link-title" placeholder="새 글 제목" maxlength="100">'
+        '<input type="text" id="link-folder" placeholder="폴더 (비우면 맨 바깥)">'
+        '<textarea id="link-text" placeholder="새 글 내용 (선택)" spellcheck="false"></textarea>'
         "</div>"
-        '<textarea id="link-text" placeholder="새 글 내용" spellcheck="false"></textarea>'
         '<div class="toolbar"><span class="hint" id="link-label"></span>'
         '<span class="spacer"></span>'
-        '<button class="btn primary" id="link-make">만들고 링크 걸기</button>'
+        '<button class="btn primary" id="link-make">연결</button>'
         '<button class="btn" id="link-cancel">취소</button>'
         "</div></div></div>"
     )
@@ -2589,6 +2954,15 @@ def edit_body(ref: str, folder: str = "") -> str:
     options = "".join(f'<option value="{html.escape(name, quote=True)}">' for name in list_folders())
     cancel_href = f"/w/{urllib.parse.quote(ref)}" if exists else "/"
     return (
+        # 저장 단추는 문서 화면과 같이 오른쪽 위에 둡니다.
+        '<div class="toolbar">'
+        '<span id="status" class="meta"></span>'
+        '<span class="spacer"></span>'
+        '<label class="btn">파일 첨부<input type="file" id="picker" multiple hidden></label>'
+        f'<a class="btn" href="{cancel_href}">취소</a>'
+        '<button class="btn" id="save">저장 (Ctrl+S)</button>'
+        '<button class="btn primary" id="done">게시</button>'
+        "</div>"
         '<div class="titlerow">'
         f'<input type="text" id="folder" list="folders" placeholder="폴더 (선택)" '
         f'value="{html.escape(folder, quote=True)}" maxlength="200">'
@@ -2619,17 +2993,12 @@ def edit_body(ref: str, folder: str = "") -> str:
         '<button class="btn primary" id="table-insert">넣기</button>'
         '<button class="btn" id="table-cancel">취소</button>'
         "</div></div></div>"
-        + draw_modal() + link_modal() +
-        '<div class="toolbar">'
-        '<button class="btn primary" id="done">게시</button>'
-        '<button class="btn" id="save">저장 (Ctrl+S)</button>'
-        '<label class="btn">파일 첨부<input type="file" id="picker" multiple hidden></label>'
-        f'<a class="btn" href="{cancel_href}">취소</a>'
-        '<span id="status" class="meta"></span></div>'
+        + draw_modal() + link_modal(ref) +
         '<p class="hint"><b>마크다운</b> 은 원본을 그대로 고치는 모드, <b>서식 편집</b> 은 '
         '꾸며진 화면에서 바로 고치는 모드입니다. 두 모드는 오갈 때마다 서로 옮겨 적히고, '
         '저장되는 파일은 언제나 마크다운입니다. '
-        '<code>[[문서 링크]]</code> 와 인라인 <code>코드</code> 는 마크다운 모드에서 넣어 주세요.<br>'
+        '인라인 <code>코드</code> 는 마크다운 모드에서 넣어 주세요. 글끼리 연결은 <b>글 연결</b> '
+        '하나로 합니다 — 있는 글은 목록에서 고르고, 없는 이름을 쓰면 그 글을 새로 만듭니다.<br>'
         '폴더는 <code>개발/서버</code> 처럼 <code>/</code> 로 여러 단계를 씁니다. '
         '비워 두면 폴더 없이 저장됩니다. 문서 링크는 <code>[[문서 이름]]</code> 또는 '
         '<code>[[폴더/문서 이름]]</code>. 이미지·파일은 드래그해서 놓거나 클립보드에서 '
@@ -3124,15 +3493,25 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
 - 정한 순서는 각 폴더의 `.order` 파일에 저장되어 왼쪽 목록과 문서 목록에 그대로 쓰입니다.
 - 왼쪽 목록의 폴더 줄에 마우스를 올리면 `＋`(하위 폴더 추가), `✎`(이름·위치 바꾸기),
   `✕`(삭제) 단추가 나옵니다. 목록 맨 위 **＋ 폴더** 는 맨 바깥에 폴더를 만듭니다.
-- 문서 목록 화면의 **폴더 추가** 로 글이 없어도 폴더를 미리 만들어 둘 수 있습니다.
-  폴더를 골라 본 화면에서는 **하위 폴더 추가**, **폴더 이름 바꾸기**, **폴더 삭제** 를 씁니다.
-  이름을 바꾸면 그 안의 문서와 하위 폴더가 통째로 따라 옮겨집니다.
+- 폴더 이름을 바꾸면 그 안의 문서와 하위 폴더가 통째로 따라 옮겨지고, 다른 글에 걸린 링크도
+  함께 고쳐집니다.
 - 이미 쓴 글은 문서 화면 오른쪽 위 **글 수정** 으로 고치고, **폴더 이동** 으로 다른 폴더로
   옮기고, **삭제** 로 지웁니다. 편집 화면에서 제목이나 폴더를 바꿔 저장해도 문서가 그대로
   옮겨집니다. 지운 글은 되돌릴 수 없습니다.
-- 다른 문서로 거는 링크는 `[[문서 이름]]` 또는 `[[폴더/문서 이름]]` 처럼 씁니다. 아직 없는
-  문서는 빨간 링크로 보이고, 누르면 바로 만들어집니다. `[[문서|보일 글자]]` 도 됩니다.
+- 글끼리 연결은 편집 화면의 **글 연결** 단추 하나로 합니다. 이미 있는 글은 목록에서 골라 링크만
+  걸고, 목록에 없는 이름을 쓰면 그 글을 새로 만들어 링크를 겁니다. 글자를 골라 두고 누르면 그
+  글자에 링크가 걸립니다. 직접 쓰려면 `[[문서 이름]]`, `[[폴더/문서 이름]]`, `[[문서|보일 글자]]`
+  형식도 그대로 됩니다. 아직 없는 문서는 빨간 링크로 보이고, 누르면 바로 만들어집니다.
+- 링크가 걸린 글자도 그대로 고칠 수 있습니다. 글자만 바뀌고 가리키는 글은 그대로 남습니다.
 - 외부 주소는 `[이름](https://example.com)` 형식의 보통 마크다운으로 씁니다.
+- **내 PC 파일** 단추로 내 컴퓨터의 파일이나 코드 위치(`파일:줄번호`)로 가는 링크를 넣습니다.
+- 글을 읽다가 글자를 고르면 **📝 메모 붙이기** 가 나옵니다. 메모를 붙인 자리는 노랗게 표시되고,
+  눌러서 보고 고칠 수 있습니다.
+- 목록은 **목록**·**숫자 목록** 단추로 넣고, Enter 로 다음 항목이 이어집니다. 빈 항목에서 Enter
+  를 누르면 목록이 끝납니다. 인용도 같습니다.
+- 표 안에서는 화살표로 칸 사이를 오갑니다. 위아래는 바로, 좌우는 글자 끝에 닿으면 옆 칸으로
+  넘어가고, 맨 윗줄·맨 아랫줄에서 더 누르면 표 밖으로 나옵니다.
+- Enter 를 여러 번 누르면 누른 만큼 줄이 띄워집니다.
 - 편집 화면에 이미지나 파일을 드래그해서 놓거나, 스크린샷을 그대로 붙여넣으면
   `files/` 폴더에 저장되고 본문에 링크가 삽입됩니다.
 - **그림** 단추로 자유선·직선·사각형·타원·화살표를 그려 넣을 수 있습니다. 그림은 SVG 한 장으로
@@ -3142,7 +3521,8 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
   동기화 폴더로 지정하면 다른 기기에서도 같은 내용을 보고 고칠 수 있습니다.
 - 편집 화면 위쪽에서 **마크다운**(원본을 그대로 고치기)과 **서식 편집**(꾸며진 화면에서
   바로 고치기) 두 모드를 오갈 수 있습니다. 어느 쪽에서 고쳐도 파일은 마크다운으로 저장됩니다.
-- `Ctrl+S` 로 저장합니다.
+- 저장 단추는 편집 화면 오른쪽 위에 있습니다. `Ctrl+S` 로도 저장되고, **게시** 는 저장한 뒤
+  문서 화면으로 나갑니다.
 
 ## 시작하기
 
