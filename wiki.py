@@ -38,6 +38,7 @@ DATA = ROOT
 PAGES = DATA / "pages"
 FILES = DATA / "files"
 CONFIG = DATA / "config.json"
+COMMENTS = DATA / "comments.json"   # 글마다 달린 댓글
 HOME = "홈"
 ORDER_FILE = ".order"
 DEFAULT_NAME = "위키"
@@ -54,11 +55,12 @@ NOTE_RE = r"\{\{([\s\S]+?)\|\|([\s\S]+?)\}\}"  # 메모는 여러 줄일 수 있
 # 다른 기기와 같은 내용을 보게 됩니다.
 
 def use_data_dir(path: Path) -> None:
-    global DATA, PAGES, FILES, CONFIG
+    global DATA, PAGES, FILES, CONFIG, COMMENTS
     DATA = path
     PAGES = DATA / "pages"
     FILES = DATA / "files"
     CONFIG = DATA / "config.json"
+    COMMENTS = DATA / "comments.json"
     PAGES.mkdir(parents=True, exist_ok=True)
     FILES.mkdir(parents=True, exist_ok=True)
 
@@ -92,7 +94,7 @@ def move_data_to(target: Path) -> tuple[bool, str]:
         message = "그 폴더에 있던 내용을 그대로 씁니다."
     else:
         try:
-            for name in ("pages", "files", "config.json"):
+            for name in ("pages", "files", "config.json", "comments.json"):
                 source = DATA / name
                 if source.exists():
                     shutil.move(str(source), str(target / name))
@@ -249,6 +251,94 @@ def write_page(ref: str, text: str) -> None:
 def delete_page(ref: str) -> None:
     page_path(ref).unlink(missing_ok=True)
     forget_scan()
+
+
+# ---------------------------------------------------------------- 댓글
+# 글마다 달린 댓글을 데이터 폴더의 comments.json 한 곳에 모아 둡니다.
+# 글이 옮겨지거나 지워지면 댓글도 따라 옮겨지고 지워집니다.
+
+COMMENT_LOCK = threading.Lock()
+
+
+def read_comments() -> dict:
+    try:
+        stored = json.loads(COMMENTS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def write_comments(all_comments: dict) -> None:
+    keep = {ref: rows for ref, rows in all_comments.items() if rows}
+    if not keep:
+        COMMENTS.unlink(missing_ok=True)
+        return
+    COMMENTS.write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def page_comments(ref: str) -> list[dict]:
+    rows = read_comments().get(ref, [])
+    return sorted(rows, key=lambda row: row.get("at", ""))
+
+
+def add_comment(ref: str, text: str) -> tuple[bool, str]:
+    with COMMENT_LOCK:
+        all_comments = read_comments()
+        all_comments.setdefault(ref, []).append({
+            "at": datetime.now().isoformat(timespec="microseconds"),
+            "text": text.strip(),
+        })
+        write_comments(all_comments)
+    return True, "댓글을 남겼습니다."
+
+
+def change_comment(ref: str, at: str, text: str | None) -> tuple[bool, str]:
+    """댓글 내용을 고치거나(text), 지웁니다(text=None)."""
+    with COMMENT_LOCK:
+        all_comments = read_comments()
+        rows = all_comments.get(ref, [])
+        for index, row in enumerate(rows):
+            if row.get("at") != at:
+                continue
+            if text is None:
+                rows.pop(index)
+                done = "댓글을 지웠습니다."
+            else:
+                row["text"] = text.strip()
+                row["edited"] = datetime.now().isoformat(timespec="seconds")
+                done = "댓글을 고쳤습니다."
+            all_comments[ref] = rows
+            write_comments(all_comments)
+            return True, done
+    return False, "그 댓글을 찾지 못했습니다."
+
+
+def move_comments(old_ref: str, new_ref: str) -> None:
+    """글이나 폴더가 옮겨지면 그 아래 글들의 댓글도 함께 옮깁니다."""
+    with COMMENT_LOCK:
+        all_comments = read_comments()
+        moved = {}
+        for ref, rows in all_comments.items():
+            if ref == old_ref:
+                moved[new_ref] = rows
+            elif ref.startswith(old_ref + "/"):
+                moved[new_ref + ref[len(old_ref):]] = rows
+            else:
+                moved[ref] = rows
+        if moved != all_comments:
+            write_comments(moved)
+
+
+def drop_comments(ref: str) -> None:
+    """글이나 폴더가 지워지면 그 아래 댓글도 지웁니다."""
+    with COMMENT_LOCK:
+        all_comments = read_comments()
+        keep = {
+            other: rows for other, rows in all_comments.items()
+            if other != ref and not other.startswith(ref + "/")
+        }
+        if keep != all_comments:
+            write_comments(keep)
 
 
 def add_note(ref: str, quote: str, note: str) -> tuple[bool, str]:
@@ -464,6 +554,7 @@ def rename_folder(folder: str, to: str) -> tuple[bool, str]:
     target.parent.mkdir(parents=True, exist_ok=True)
     source.rename(target)
     forget_scan()
+    move_comments(folder, to)
     moved = relink(folder, to)
     tail = f" 링크 {moved}곳도 고쳤습니다." if moved else ""
     return True, f"‘{folder}’ 폴더를 ‘{to}’ 로 옮겼습니다.{tail}"
@@ -1059,6 +1150,24 @@ img { max-width: 100%; border-radius: 6px; }
   position: absolute; z-index: 20; padding: 4px 12px; font-size: 13px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
 }
+#comments { margin-top: 36px; border-top: 1px solid var(--line); padding-top: 8px; }
+#comments h2 { border: none; padding: 0; }
+.comments { list-style: none; padding: 0; margin: 0 0 16px; }
+.comments li {
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+  margin-bottom: 8px; background: var(--card);
+}
+.comments .comment-head { display: flex; align-items: center; gap: 6px; }
+.comments .comment-head .spacer { flex: 1; }
+.comments .comment-head .btn { padding: 1px 8px; font-size: 12px; visibility: hidden; }
+.comments li:hover .comment-head .btn { visibility: visible; }
+.comments .comment-text > :first-child { margin-top: 4px; }
+.comments .comment-text > :last-child { margin-bottom: 0; }
+#comments textarea {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card); color: var(--fg); font: inherit; resize: vertical;
+}
+#comments .toolbar { margin: 8px 0 0; }
 .note {
   background: var(--mark); border-bottom: 2px solid #d4a72c; cursor: pointer;
   border-radius: 2px;
@@ -1650,9 +1759,43 @@ def view_body(ref: str) -> str:
         f'<button class="btn danger" id="remove">삭제</button></div>'
         f"<h1>{html.escape(title_of(ref))}</h1>{render(read_page(ref))}"
         f"{children_list(ref)}"
+        f"{comments_body(ref)}"
         f'<button class="btn primary" id="note-bubble" '
         f'data-ref="{html.escape(ref, quote=True)}" hidden>📝 메모 붙이기</button>'
         '<div id="note-card" hidden></div>'
+    )
+
+
+def comments_body(ref: str) -> str:
+    """글 아래에 붙는 댓글 목록과 쓰는 칸."""
+    rows = []
+    for comment in page_comments(ref):
+        text = comment.get("text", "")
+        try:
+            when = datetime.fromisoformat(comment.get("at", "")).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            when = ""
+        edited = ' <span class="meta">(고침)</span>' if comment.get("edited") else ""
+        rows.append(
+            f'<li data-at="{html.escape(comment.get("at", ""), quote=True)}" '
+            f'data-text="{html.escape(text, quote=True)}">'
+            f'<div class="comment-head"><span class="meta">{when}</span>{edited}'
+            '<span class="spacer"></span>'
+            '<button class="btn" data-act="edit" title="댓글 고치기">✎</button>'
+            '<button class="btn danger" data-act="remove" title="댓글 지우기">✕</button></div>'
+            f'<div class="comment-text">{render(text)}</div></li>'
+        )
+    count = f' <span class="meta">{len(rows)}</span>' if rows else ""
+    listing = f'<ul class="comments">{"".join(rows)}</ul>' if rows else ""
+    return (
+        f'<div id="comments" data-ref="{html.escape(ref, quote=True)}">'
+        f"<h2>댓글{count}</h2>{listing}"
+        '<textarea id="comment-text" rows="3" spellcheck="false" '
+        'placeholder="댓글을 씁니다. 마크다운을 쓸 수 있고 Ctrl+Enter 로 등록됩니다."></textarea>'
+        '<div class="toolbar"><span class="hint" id="comment-hint"></span>'
+        '<span class="spacer"></span>'
+        '<button class="btn primary" id="comment-add">댓글 쓰기</button></div>'
+        "</div>"
     )
 
 
@@ -1785,6 +1928,70 @@ if (pageTools) {
     const removed = await post('/delete', {ref: pageTools.dataset.ref});
     if (removed) { goFolder(removed.folder); }
   };
+}
+
+// 글 아래 댓글: 쓰기, 고치기, 지우기.
+const comments = document.getElementById('comments');
+if (comments) {
+  const box = document.getElementById('comment-text');
+  const hint = document.getElementById('comment-hint');
+
+  async function addComment() {
+    const text = box.value.trim();
+    if (!text) { box.focus(); return; }
+    hint.textContent = '올리는 중...';
+    if (await post('/comment', {ref: comments.dataset.ref, text: text})) { location.reload(); }
+    else { hint.textContent = ''; }
+  }
+
+  document.getElementById('comment-add').onclick = addComment;
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); addComment(); }
+  });
+
+  comments.addEventListener('click', async (e) => {
+    const button = e.target.closest('button[data-act]');
+    if (!button) { return; }
+    const row = button.closest('li');
+    const at = row.dataset.at;
+    if (button.dataset.act === 'remove') {
+      if (!confirm('이 댓글을 지울까요?')) { return; }
+      if (await post('/comment/remove', {ref: comments.dataset.ref, at: at})) { location.reload(); }
+      return;
+    }
+    if (row.querySelector('textarea')) { return; }   // 이미 고치는 중입니다
+    const shown = row.querySelector('.comment-text');
+    const edit = document.createElement('textarea');
+    edit.rows = 3;
+    edit.value = row.dataset.text;
+    const keep = document.createElement('button');
+    keep.className = 'btn primary';
+    keep.textContent = '저장';
+    const drop = document.createElement('button');
+    drop.className = 'btn';
+    drop.textContent = '취소';
+    const foot = document.createElement('div');
+    foot.className = 'toolbar';
+    foot.append(keep, drop);
+    shown.hidden = true;
+    row.append(edit, foot);
+    edit.focus();
+    drop.onclick = () => { edit.remove(); foot.remove(); shown.hidden = false; };
+    keep.onclick = async () => {
+      const text = edit.value.trim();
+      if (!text) { edit.focus(); return; }
+      if (await post('/comment/edit', {ref: comments.dataset.ref, at: at, text: text})) {
+        location.reload();
+      }
+    };
+    edit.addEventListener('keydown', (key) => {
+      if (key.key === 'Escape') { drop.onclick(); }
+      else if (key.key === 'Enter' && (key.ctrlKey || key.metaKey)) {
+        key.preventDefault();
+        keep.onclick();
+      }
+    });
+  });
 }
 """
 
@@ -3227,6 +3434,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(change_note(ref, data.get("quote", ""), note), ref)
             else:
                 self.reply(add_note(ref, data.get("quote", ""), note), ref)
+        elif prefix == "comment":
+            data = self.read_json()
+            ref = normalize_ref(data.get("ref", ""))
+            text = data.get("text", "").strip()
+            if not page_exists(ref):
+                self.send_text(400, "없는 문서입니다.")
+            elif rest == "remove":
+                self.reply(change_comment(ref, data.get("at", ""), None), ref)
+            elif not text:
+                self.send_text(400, "댓글 내용을 적어 주세요.")
+            elif rest == "edit":
+                self.reply(change_comment(ref, data.get("at", ""), text), ref)
+            else:
+                self.reply(add_comment(ref, text), ref)
         elif prefix == "order":
             self.save_order()
         elif prefix == "preview":
@@ -3278,6 +3499,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_text(400, f"‘{ref}’ 아래에 이미 다른 글이 있어 옮기지 못했습니다.")
                 return
             delete_page(original)
+            move_comments(original, ref)
             relink(original, ref)
         self.send_json({"ref": ref})
 
@@ -3307,6 +3529,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_text(400, f"‘{new_ref}’ 아래에 이미 다른 글이 있어 옮기지 못했습니다.")
                 return
             delete_page(ref)
+            move_comments(ref, new_ref)
             relink(ref, new_ref)
         self.send_json({"ref": new_ref})
 
@@ -3320,6 +3543,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_text(400, f"이 글 아래에 글이 {len(under)}개 있습니다. 먼저 옮기거나 지워 주세요.")
             return
         delete_page(ref)
+        drop_comments(ref)
         self.send_json({"folder": folder_of(ref)})
 
     def change_data_dir(self):
@@ -3507,6 +3731,8 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
 - **내 PC 파일** 단추로 내 컴퓨터의 파일이나 코드 위치(`파일:줄번호`)로 가는 링크를 넣습니다.
 - 글을 읽다가 글자를 고르면 **📝 메모 붙이기** 가 나옵니다. 메모를 붙인 자리는 노랗게 표시되고,
   눌러서 보고 고칠 수 있습니다.
+- 글 맨 아래에는 **댓글** 을 남길 수 있습니다. 마크다운을 그대로 쓸 수 있고 `Ctrl+Enter` 로
+  등록됩니다. 올린 댓글은 `✎` 로 고치고 `✕` 로 지웁니다. 글을 옮겨도 댓글은 따라갑니다.
 - 목록은 **목록**·**숫자 목록** 단추로 넣고, Enter 로 다음 항목이 이어집니다. 빈 항목에서 Enter
   를 누르면 목록이 끝납니다. 인용도 같습니다.
 - 표 안에서는 화살표로 칸 사이를 오갑니다. 위아래는 바로, 좌우는 글자 끝에 닿으면 옆 칸으로
