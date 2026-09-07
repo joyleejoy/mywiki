@@ -341,6 +341,37 @@ def drop_comments(ref: str) -> None:
             write_comments(keep)
 
 
+CODE_SPAN = re.compile(r"(?P<ticks>`+)(?P<body>.+?)(?P=ticks)")
+FENCE_LINE = re.compile(r"^[ 	]*(`{3,}|~{3,})", re.M)
+
+
+def code_blocks(text: str) -> list[tuple[int, int]]:
+    """``` 로 감싼 코드 블록이 차지한 구간을 돌려줍니다."""
+    spans: list[tuple[int, int]] = []
+    open_at, mark = -1, ""
+    for line in FENCE_LINE.finditer(text):
+        ticks = line.group(1)
+        if open_at < 0:
+            open_at, mark = line.start(), ticks[0]
+        elif ticks[0] == mark:
+            spans.append((open_at, line.end()))
+            open_at, mark = -1, ""
+    if open_at >= 0:  # 닫히지 않은 블록은 글 끝까지로 봅니다
+        spans.append((open_at, len(text)))
+    return spans
+
+
+def widen_over_code(text: str, at: int, end: int) -> tuple[int, int]:
+    """고른 자리가 `코드` 표시에 걸쳐 있으면 그 표시 바깥까지 넓힙니다.
+
+    메모 기호를 백틱 안에 넣으면 메모가 아니라 글자 그대로 보이기 때문입니다.
+    """
+    for span in CODE_SPAN.finditer(text):
+        if span.start() < end and at < span.end():
+            at, end = min(at, span.start()), max(end, span.end())
+    return at, end
+
+
 def add_note(ref: str, quote: str, note: str) -> tuple[bool, str]:
     """글의 고른 부분을 메모 표시로 감쌉니다."""
     text = read_page(ref)
@@ -353,8 +384,13 @@ def add_note(ref: str, quote: str, note: str) -> tuple[bool, str]:
     if at < 0:
         return False, "고른 글자를 본문에서 찾지 못했습니다. 글을 고친 뒤 다시 해 주세요."
 
-    note = note.strip().replace("}}", "} }")
     end = at + len(quote)
+    if any(start <= at < stop for start, stop in code_blocks(text)):
+        return False, "코드 블록 안에는 메모를 붙일 수 없습니다. 블록 밖의 글자를 골라 주세요."
+    at, end = widen_over_code(text, at, end)
+    quote = text[at:end]
+
+    note = note.strip().replace("}}", "} }")
     write_page(ref, text[:at] + "{{" + quote + "||" + note + "}}" + text[end:])
     return True, "메모를 붙였습니다."
 
@@ -363,13 +399,15 @@ def change_note(ref: str, quote: str, note: str | None) -> tuple[bool, str]:
     """메모 내용을 고치거나(note), 표시를 걷어냅니다(note=None)."""
     text = read_page(ref)
     for found in re.finditer(NOTE_RE, text):
-        if found.group(1) != quote:
+        # 화면에서 온 글자에는 `백틱` 같은 서식 기호가 없으므로 그것까지 벗겨 견줍니다.
+        inner = found.group(1)
+        if quote not in (inner, inner.strip("`")):
             continue
         if note is None:
-            body = quote
+            body = inner
             done = "메모를 지웠습니다."
         else:
-            body = "{{" + quote + "||" + note.strip().replace("}}", "} }") + "}}"
+            body = "{{" + inner + "||" + note.strip().replace("}}", "} }") + "}}"
             done = "메모를 고쳤습니다."
         write_page(ref, text[:found.start()] + body + text[found.end():])
         return True, done
