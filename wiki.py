@@ -48,6 +48,9 @@ DEFAULT_PORT = 8800
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 WIKILINK_RE = r"\[\[([^\[\]]+?)\]\]"
 NOTE_RE = r"\{\{([\s\S]+?)\|\|([\s\S]+?)\}\}"  # 메모는 여러 줄일 수 있습니다
+# 메모 안 줄바꿈을 한 줄로 눌러 둘 때 쓰는 표시. 마크다운이 속으로 쓰는 \x02..\x03 과
+# 겹치지 않게, 글에 쓰일 일이 없는 사용자 영역 문자를 씁니다.
+NOTE_NEWLINE = "\ue000"
 
 
 # ---------------------------------------------------------------- 데이터 폴더
@@ -689,9 +692,9 @@ class NoteProcessor(InlineProcessor):
 
     def handleMatch(self, m, data):
         element = ElementTree.Element("span")
-        element.text = m.group(1)
+        element.text = m.group(1).replace(NOTE_NEWLINE, " ")
         element.set("class", "note")
-        element.set("data-note", m.group(2))
+        element.set("data-note", m.group(2).replace(NOTE_NEWLINE, "\n"))
         return element, m.start(0), m.end(0)
 
 
@@ -784,11 +787,30 @@ def loosen(text: str) -> str:
     return "\n".join(lines)
 
 
+def press_notes(text: str) -> str:
+    """여러 줄에 걸친 {{고른 글자||메모}} 를 한 줄로 눌러 둡니다.
+
+    메모 안에 줄바꿈이 있으면 목록·제목 규칙이 메모를 두 덩이로 끊어 읽어서,
+    메모 표시가 아니라 {{ }} 기호째로 보였습니다. 코드블록 안은 그대로 둡니다.
+    """
+    if "{{" not in text:
+        return text
+    fenced = code_blocks(text)
+
+    def press(found):
+        if any(start <= found.start() < stop for start, stop in fenced):
+            return found.group(0)
+        return re.sub(r"\n[ \t]*", NOTE_NEWLINE, found.group(0))
+
+    return re.sub(NOTE_RE, press, text)
+
+
 def render(text: str, highlight: bool = True) -> str:
     engine = MD if highlight else MD_PLAIN
     with MD_LOCK:
         engine.reset()
-        return engine.convert(loosen(text))
+        # 메모를 먼저 한 줄로 눌러 두어야 loosen() 이 메모 속을 끊지 않습니다.
+        return engine.convert(loosen(press_notes(text)))
 
 
 class MarkdownWriter(HTMLParser):
