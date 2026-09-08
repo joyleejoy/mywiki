@@ -1140,6 +1140,33 @@ img { max-width: 100%; border-radius: 6px; }
 #rich > :first-child { margin-top: 0; }
 #rich:empty::before { content: "여기에 바로 쓰면 됩니다."; color: var(--muted); }
 .mdbar .btn[disabled] { opacity: .4; cursor: default; }
+
+/* 편집 화면은 글이 길어져도 화면이 통째로 흘러가지 않게, 편집창에만 스크롤을 답니다.
+   저장 단추·제목·서식 단추는 늘 같은 자리에 붙어 있습니다.
+   자리가 아주 좁아 편집창이 더 줄어들 수 없을 때만 화면 스크롤이 대신 나옵니다. */
+body.editing { overflow-y: auto; }
+body.editing main {
+  display: flex; flex-direction: column;
+  height: calc(100vh - var(--head));
+  height: calc(100dvh - var(--head));
+  padding: 12px 24px 14px; max-width: 1200px;
+}
+body.editing main > * { flex: none; }
+body.editing #editor, body.editing #rich {
+  flex: 1 1 auto; min-height: 160px; height: auto; resize: none; overflow-y: auto;
+}
+/* 편집창에 자리를 더 내주려고 위쪽 단추·제목 줄을 조금 좁힙니다. */
+body.editing main > .toolbar { margin: 0 0 8px; }
+body.editing main > .titlerow { margin-bottom: 8px; }
+body.editing #folder, body.editing #title { padding: 7px 11px; font-size: 18px; }
+body.editing #folder { font-size: 14px; }
+body.editing main > .tabs, body.editing main > .mdbar { margin-bottom: 6px; }
+details.hint { margin: 10px 0 0; }
+details.hint > summary {
+  cursor: pointer; color: var(--muted); font-size: 13px; user-select: none;
+}
+details.hint > summary:hover { color: var(--accent); }
+details.hint > p { margin: 8px 0 0; }
 .modal {
   position: fixed; inset: 0; z-index: 30; padding: 20px; background: rgba(0, 0, 0, .45);
   display: flex; align-items: center; justify-content: center;
@@ -1605,7 +1632,7 @@ aside.addEventListener('drop', async (e) => {
 def shell(
     title: str, body: str, script: str = "", query: str = "",
     current_ref: str = "", current_folder: str = "", closed: set[str] = frozenset(),
-    side_sort: str = "order",
+    side_sort: str = "order", body_class: str = "",
 ) -> bytes:
     page = f"""<!doctype html>
 <html lang="ko"><head>
@@ -1618,7 +1645,7 @@ if (localStorage.getItem('sidebar') === 'off') {{
 const savedSide = localStorage.getItem('sideWidth');
 if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide); }}
 </script>
-</head><body>
+</head><body class="{body_class}">
 <header>
   <button class="btn" id="toggle" title="문서 목록 접기/펴기">☰</button>
   <a class="brand" href="{home_link()}" title="{home_title()}">📚 {html.escape(wiki_name())}</a>
@@ -2098,21 +2125,51 @@ function typeBlock(text) {
   typeText(head + text + (ahead.trim() ? '\\n' : ''));
 }
 
-// 창(표·그림)을 열면 서식 편집 커서 자리를 잃어버립니다. 열 때 기억해 두고 넣을 때 되살립니다.
+// 창(글 연결·표·그림)을 열거나 제목·폴더 칸으로 옮겨 가면 서식 편집 커서 자리를 잃어버립니다.
+// 그대로 focus() 를 주면 커서가 글 맨 앞으로 가면서 편집창도 맨 위로 올라가 버리므로,
+// 고치던 자리를 늘 기억해 두고 돌아올 때 되살립니다.
 let richSpot = null;
 
 function keepRichSpot() {
   const chosen = document.getSelection();
-  richSpot = (richMode && chosen.rangeCount && rich.contains(chosen.anchorNode))
-    ? chosen.getRangeAt(0).cloneRange() : null;
+  // 자리를 알 수 없을 때는 지우지 않고 마지막으로 알던 자리를 그대로 둡니다.
+  if (richMode && chosen.rangeCount && rich.contains(chosen.anchorNode)) {
+    richSpot = chosen.getRangeAt(0).cloneRange();
+  }
+}
+
+document.addEventListener('selectionchange', keepRichSpot);
+
+/** 커서가 편집창 밖으로 밀려 있으면 보이는 자리까지만 살짝 굴립니다. */
+function showCaret(pane) {
+  const chosen = document.getSelection();
+  if (!chosen.rangeCount) { return; }
+  let spot = chosen.getRangeAt(0).getBoundingClientRect();
+  if (!spot.height && !spot.top) {       // 빈 줄에서는 크기가 0 으로 나옵니다
+    const node = chosen.anchorNode;
+    const near = node && (node.nodeType === 1 ? node : node.parentElement);
+    if (!near) { return; }
+    spot = near.getBoundingClientRect();
+  }
+  const box = pane.getBoundingClientRect();
+  if (spot.top < box.top + 8) { pane.scrollTop -= box.top + 8 - spot.top; }
+  else if (spot.bottom > box.bottom - 8) { pane.scrollTop += spot.bottom - box.bottom + 8; }
 }
 
 function focusRichSpot() {
   rich.focus();
-  if (!richSpot) { return; }
-  const chosen = document.getSelection();
-  chosen.removeAllRanges();
-  chosen.addRange(richSpot);
+  if (richSpot) {
+    const chosen = document.getSelection();
+    chosen.removeAllRanges();
+    chosen.addRange(richSpot);
+  }
+  showCaret(rich);
+}
+
+/** 창이나 다른 칸에서 아까 고치던 자리로 그대로 돌아옵니다. */
+function backToEditSpot() {
+  if (richMode) { focusRichSpot(); return; }
+  editor.focus();   // 마크다운 칸은 커서와 스크롤을 브라우저가 지켜 줍니다
 }
 
 function prefixLine(prefix) {
@@ -2142,7 +2199,6 @@ function showLinkMode() {
 
 function openLink() {
   if (richMode) {
-    keepRichSpot();
     linkLabel = String(document.getSelection()).trim();
   } else {
     linkSpan = {start: editor.selectionStart, end: editor.selectionEnd};
@@ -2165,7 +2221,7 @@ function openLink() {
 
 function closeLinkModal() {
   linkModal.hidden = true;
-  (richMode ? rich : editor).focus();
+  backToEditSpot();
 }
 
 function putLink(ref) {
@@ -2426,7 +2482,7 @@ function openTable() {
 
 function closeTable() {
   tableModal.hidden = true;
-  (richMode ? rich : editor).focus();
+  backToEditSpot();
 }
 
 // 칸 속에는 공백을 남기지 않습니다. 빈 칸은 빈 칸으로 그대로 둡니다.
@@ -2743,7 +2799,7 @@ async function openDraw(image) {
 function closeDraw() {
   drawModal.hidden = true;
   editingImage = null;
-  (richMode ? rich : editor).focus();
+  backToEditSpot();
 }
 
 document.getElementById('draw-insert').onclick = async () => {
@@ -2955,6 +3011,10 @@ async function pullFromRich() {
 
 async function setMode(toRich) {
   if (toRich === richMode) { return; }
+  // 모드를 바꾸면 본문을 다시 그리므로 커서 자리는 버리고, 보고 있던 만큼만 다시 내려 줍니다.
+  const from = richMode ? rich : editor;
+  const room = from.scrollHeight - from.clientHeight;
+  const ratio = room > 0 ? from.scrollTop / room : 0;
   if (toRich) {
     const shown = await post('/preview', {text: editor.value});
     if (!shown) { return; }
@@ -2971,7 +3031,10 @@ async function setMode(toRich) {
   for (const button of mdbar.querySelectorAll('button')) {
     button.disabled = toRich && !button.dataset.rich;
   }
-  (toRich ? rich : editor).focus();
+  richSpot = null;                       // 새로 그린 본문에는 옛 자리가 없습니다
+  const to = toRich ? rich : editor;
+  to.focus();
+  to.scrollTop = ratio * (to.scrollHeight - to.clientHeight);
 }
 
 tabText.onclick = () => setMode(false);
@@ -2987,7 +3050,7 @@ document.addEventListener('keydown', (e) => {
 for (const box of [titleInput, folderInput]) {
   box.addEventListener('keydown', (e) => {
     // 서식 편집 모드에서는 textarea 가 숨어 있어 focus() 가 통하지 않습니다.
-    if (e.key === 'Enter') { e.preventDefault(); (richMode ? rich : editor).focus(); }
+    if (e.key === 'Enter') { e.preventDefault(); backToEditSpot(); }
   });
 }
 
@@ -3239,7 +3302,8 @@ def edit_body(ref: str, folder: str = "") -> str:
         '<button class="btn" id="table-cancel">취소</button>'
         "</div></div></div>"
         + draw_modal() + link_modal(ref) +
-        '<p class="hint"><b>마크다운</b> 은 원본을 그대로 고치는 모드, <b>서식 편집</b> 은 '
+        '<details class="hint"><summary>편집 도움말</summary>'
+        '<p><b>마크다운</b> 은 원본을 그대로 고치는 모드, <b>서식 편집</b> 은 '
         '꾸며진 화면에서 바로 고치는 모드입니다. 두 모드는 오갈 때마다 서로 옮겨 적히고, '
         '저장되는 파일은 언제나 마크다운입니다. '
         '인라인 <code>코드</code> 는 마크다운 모드에서 넣어 주세요. 글끼리 연결은 <b>글 연결</b> '
@@ -3248,6 +3312,7 @@ def edit_body(ref: str, folder: str = "") -> str:
         '비워 두면 폴더 없이 저장됩니다. 문서 링크는 <code>[[문서 이름]]</code> 또는 '
         '<code>[[폴더/문서 이름]]</code>. 이미지·파일은 드래그해서 놓거나 클립보드에서 '
         '바로 붙여넣을 수 있습니다. 제목이나 폴더를 바꿔 저장하면 문서가 그대로 옮겨집니다.</p>'
+        '</details>'
     )
 
 
@@ -3403,7 +3468,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(shell(name, start_body(), closed=closed, side_sort=side))
         elif prefix == "new":
             folder = normalize_ref(query.get("folder", [""])[0])
-            self.send(shell(f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT, closed=closed, side_sort=side))
+            self.send(shell(
+                f"새 글 - {name}", edit_body("", folder), EDITOR_SCRIPT,
+                closed=closed, side_sort=side, body_class="editing",
+            ))
         elif prefix == "search":
             keyword = query.get("q", [""])[0].strip()
             self.send(shell(
@@ -3429,7 +3497,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send(shell(
                     f"{title_of(ref)} 편집", edit_body(ref), EDITOR_SCRIPT,
-                    current_ref=ref, closed=closed, side_sort=side,
+                    current_ref=ref, closed=closed, side_sort=side, body_class="editing",
                 ))
         elif prefix == "f":
             self.serve_file(rest)
