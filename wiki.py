@@ -39,6 +39,7 @@ PAGES = DATA / "pages"
 FILES = DATA / "files"
 CONFIG = DATA / "config.json"
 COMMENTS = DATA / "comments.json"   # 글마다 달린 댓글
+TRASH = DATA / "trash"              # 지운 글·폴더를 되살릴 수 있게 담아 두는 곳
 HOME = "홈"
 ORDER_FILE = ".order"
 DEFAULT_NAME = "위키"
@@ -58,12 +59,13 @@ NOTE_NEWLINE = "\ue000"
 # 다른 기기와 같은 내용을 보게 됩니다.
 
 def use_data_dir(path: Path) -> None:
-    global DATA, PAGES, FILES, CONFIG, COMMENTS
+    global DATA, PAGES, FILES, CONFIG, COMMENTS, TRASH
     DATA = path
     PAGES = DATA / "pages"
     FILES = DATA / "files"
     CONFIG = DATA / "config.json"
     COMMENTS = DATA / "comments.json"
+    TRASH = DATA / "trash"
     PAGES.mkdir(parents=True, exist_ok=True)
     FILES.mkdir(parents=True, exist_ok=True)
 
@@ -97,7 +99,7 @@ def move_data_to(target: Path) -> tuple[bool, str]:
         message = "그 폴더에 있던 내용을 그대로 씁니다."
     else:
         try:
-            for name in ("pages", "files", "config.json", "comments.json"):
+            for name in ("pages", "files", "config.json", "comments.json", "trash"):
                 source = DATA / name
                 if source.exists():
                     shutil.move(str(source), str(target / name))
@@ -330,18 +332,6 @@ def move_comments(old_ref: str, new_ref: str) -> None:
                 moved[ref] = rows
         if moved != all_comments:
             write_comments(moved)
-
-
-def drop_comments(ref: str) -> None:
-    """글이나 폴더가 지워지면 그 아래 댓글도 지웁니다."""
-    with COMMENT_LOCK:
-        all_comments = read_comments()
-        keep = {
-            other: rows for other, rows in all_comments.items()
-            if other != ref and not other.startswith(ref + "/")
-        }
-        if keep != all_comments:
-            write_comments(keep)
 
 
 CODE_SPAN = re.compile(r"(?P<ticks>`+)(?P<body>.+?)(?P=ticks)")
@@ -601,14 +591,171 @@ def rename_folder(folder: str, to: str) -> tuple[bool, str]:
     return True, f"‘{folder}’ 폴더를 ‘{to}’ 로 옮겼습니다.{tail}"
 
 
-def delete_folder(folder: str) -> tuple[bool, str]:
-    """문서가 남아 있지 않은 폴더만 지웁니다."""
-    inside = [ref for ref, _ in list_pages() if in_folder(ref, folder)]
-    if inside:
-        return False, f"‘{folder}’ 안에 문서가 {len(inside)}개 있습니다. 먼저 옮기거나 지워 주세요."
-    shutil.rmtree(folder_path(folder))
+# ---------------------------------------------------------------- 휴지통
+# 지운 글·폴더는 곧바로 없애지 않고 데이터 폴더의 trash/ 로 옮겨 둡니다.
+# 한 번 지울 때마다 trash/<지운 때-이름>/ 하나가 생기고, 그 안에
+#   meta.json — 어디에 있던 무엇인지, 딸려 간 글 목록, 달려 있던 댓글
+#   content/  — 글 파일과 하위 폴더 그대로
+# 를 담아 둡니다. 되살리기는 이것을 원래 자리로 되돌려 놓는 일입니다.
+
+TRASH_META = "meta.json"
+TRASH_BODY = "content"
+
+
+def pages_under(ref: str) -> list[str]:
+    """이 글(또는 폴더) 자신과 그 아래 딸린 글을 모두 돌려줍니다."""
+    if not ref:
+        return []
+    return sorted(name for name, _ in list_pages() if name == ref or in_folder(name, ref))
+
+
+def folders_under(ref: str) -> list[str]:
+    """이 폴더 아래 딸린 하위 폴더입니다 (자신은 넣지 않습니다)."""
+    if not ref:
+        return []
+    return sorted(name for name in list_folders() if in_folder(name, ref))
+
+
+def trash_spot(ref: str) -> Path:
+    """휴지통 안에 쓸 새 자리를 만듭니다. 이름이 겹치면 뒤에 번호를 붙입니다."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = INVALID_CHARS.sub("_", ref.replace("/", "_"))[:60] or "이름없음"
+    spot = TRASH / f"{stamp}-{safe}"
+    number = 2
+    while spot.exists():
+        spot = TRASH / f"{stamp}-{safe}-{number}"
+        number += 1
+    return spot
+
+
+def to_trash(ref: str, kind: str) -> tuple[bool, str]:
+    """글이나 폴더를 아래 딸린 것까지 통째로 휴지통으로 옮깁니다."""
+    page = page_path(ref)
+    inside = folder_path(ref)
+    if not page.is_file() and not inside.is_dir():
+        return False, f"‘{ref}’ 는 없습니다."
+
+    refs = pages_under(ref)
+    with COMMENT_LOCK:
+        all_comments = read_comments()
+        taken = {
+            other: rows for other, rows in all_comments.items()
+            if other == ref or in_folder(other, ref)
+        }
+        spot = trash_spot(ref)
+        body = spot / TRASH_BODY
+        try:
+            body.mkdir(parents=True)
+            if page.is_file():
+                shutil.move(str(page), str(body / page.name))
+            if inside.is_dir():
+                shutil.move(str(inside), str(body / title_of(ref)))
+        except OSError as error:
+            shutil.rmtree(spot, ignore_errors=True)
+            return False, f"휴지통으로 옮기지 못했습니다: {error}"
+        (spot / TRASH_META).write_text(
+            json.dumps({
+                "kind": kind, "ref": ref, "at": datetime.now().isoformat(timespec="seconds"),
+                "pages": refs, "folders": folders_under(ref), "comments": taken,
+            }, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        if taken:
+            write_comments({
+                other: rows for other, rows in all_comments.items() if other not in taken
+            })
     forget_scan()
-    return True, f"‘{folder}’ 폴더를 지웠습니다."
+    what = "폴더를" if kind == "folder" else "글을"
+    deeper = [name for name in refs if name != ref]
+    tail = f" 함께 딸린 글 {len(deeper)}개도 옮겼습니다." if deeper else ""
+    return True, f"‘{ref}’ {what} 휴지통으로 옮겼습니다.{tail}"
+
+
+def trash_rows() -> list[dict]:
+    """휴지통에 든 것을 최근에 지운 것부터 돌려줍니다."""
+    rows = []
+    if not TRASH.is_dir():
+        return rows
+    for spot in TRASH.iterdir():
+        if not spot.is_dir():
+            continue
+        try:
+            meta = json.loads((spot / TRASH_META).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        meta["id"] = spot.name
+        meta["pages"] = meta.get("pages") or []
+        rows.append(meta)
+    rows.sort(key=lambda row: row.get("at", ""), reverse=True)
+    return rows
+
+
+def trash_files(spot: Path, ref: str) -> tuple[Path, Path]:
+    """휴지통 자리에 담긴 글 파일과 하위 폴더의 경로입니다 (없을 수도 있습니다)."""
+    body = spot / TRASH_BODY
+    return body / (title_of(ref) + ".md"), body / title_of(ref)
+
+
+def from_trash(entry: str) -> tuple[bool, str]:
+    """휴지통에 든 것을 원래 자리로 되돌립니다."""
+    spot = TRASH / entry
+    if "/" in entry or "\\" in entry or not (spot / TRASH_META).is_file():
+        return False, "휴지통에 없는 것입니다."
+    meta = json.loads((spot / TRASH_META).read_text(encoding="utf-8"))
+    ref = normalize_ref(meta.get("ref", ""))
+    if not is_valid_ref(ref):
+        return False, "되살릴 자리를 알 수 없습니다."
+    page, inside = trash_files(spot, ref)
+    if page.is_file() and page_path(ref).exists():
+        return False, f"‘{ref}’ 글이 이미 있습니다. 그 글을 먼저 옮기거나 지워 주세요."
+    if inside.is_dir() and folder_path(ref).exists():
+        return False, f"‘{ref}’ 폴더가 이미 있습니다. 그 폴더를 먼저 옮기거나 지워 주세요."
+
+    with COMMENT_LOCK:
+        try:
+            page_path(ref).parent.mkdir(parents=True, exist_ok=True)
+            if page.is_file():
+                shutil.move(str(page), str(page_path(ref)))
+            if inside.is_dir():
+                shutil.move(str(inside), str(folder_path(ref)))
+        except OSError as error:
+            return False, f"되살리지 못했습니다: {error}"
+        back = meta.get("comments") or {}
+        if back:
+            all_comments = read_comments()
+            for other, rows in back.items():
+                all_comments.setdefault(other, []).extend(rows)
+            write_comments(all_comments)
+    shutil.rmtree(spot, ignore_errors=True)
+    forget_scan()
+    deeper = [name for name in (meta.get("pages") or []) if name != ref]
+    tail = f" 함께 딸린 글 {len(deeper)}개도 돌아왔습니다." if deeper else ""
+    return True, f"‘{ref}’ 를 되살렸습니다.{tail}"
+
+
+def drop_trash(entry: str) -> tuple[bool, str]:
+    """휴지통에 든 하나를 완전히 지웁니다."""
+    spot = TRASH / entry
+    if "/" in entry or "\\" in entry or not (spot / TRASH_META).is_file():
+        return False, "휴지통에 없는 것입니다."
+    shutil.rmtree(spot, ignore_errors=True)
+    return True, "완전히 지웠습니다."
+
+
+def empty_trash() -> tuple[bool, str]:
+    rows = trash_rows()
+    if not rows:
+        return True, "휴지통이 이미 비어 있습니다."
+    for row in rows:
+        shutil.rmtree(TRASH / row["id"], ignore_errors=True)
+    return True, f"휴지통을 비웠습니다. {len(rows)}개를 완전히 지웠습니다."
+
+
+def delete_folder(folder: str) -> tuple[bool, str]:
+    """폴더를 안에 든 글·하위 폴더까지 통째로 휴지통으로 보냅니다."""
+    if not folder_path(folder).is_dir():
+        return False, f"‘{folder}’ 폴더가 없습니다."
+    return to_trash(folder, "folder")
 
 
 def store_upload(filename: str, data: bytes, replace: bool = False) -> str:
@@ -1189,6 +1336,24 @@ details.hint > summary {
 }
 details.hint > summary:hover { color: var(--accent); }
 details.hint > p { margin: 8px 0 0; }
+/* 휴지통 화면과, 지우기 전에 묻는 팝업 */
+.trash { list-style: none; padding: 0; margin: 12px 0; }
+.trash li {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  margin-bottom: 8px; background: var(--card);
+}
+.trash .trash-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.trash .trash-head .spacer { flex: 1; }
+.trash .trash-head .btn { padding: 2px 10px; font-size: 13px; }
+.trash details { margin-top: 6px; }
+.trash details summary { cursor: pointer; font-size: 13px; }
+.trash details ul { margin: 6px 0 0; padding-left: 20px; font-size: 13px; color: var(--muted); }
+#drop-modal .sheet { width: 460px; }
+#drop-modal .warn { color: var(--new); font-weight: 600; margin: 10px 0 4px; }
+ul.drop-list {
+  margin: 4px 0 0; padding-left: 20px; max-height: 180px; overflow-y: auto;
+  font-size: 13px; color: var(--muted);
+}
 .modal {
   position: fixed; inset: 0; z-index: 30; padding: 20px; background: rgba(0, 0, 0, .45);
   display: flex; align-items: center; justify-content: center;
@@ -1404,6 +1569,74 @@ function goFolder(folder) {
   location.href = folder ? '/?folder=' + encodeURIComponent(folder) : '/';
 }
 
+// 지우기 전에 무엇이 함께 지워지는지 보여 주고 한 번 더 묻습니다.
+const dropModal = document.getElementById('drop-modal');
+let dropAnswer = null;
+
+function closeDrop(answer) {
+  if (!dropAnswer) { return; }
+  dropModal.hidden = true;
+  const say = dropAnswer;
+  dropAnswer = null;
+  say(answer);
+}
+
+function dropLines(refs) {
+  const list = document.createElement('ul');
+  list.className = 'drop-list';
+  for (const ref of refs.slice(0, 30)) {
+    const item = document.createElement('li');
+    item.textContent = ref;
+    list.append(item);
+  }
+  if (refs.length > 30) {
+    const more = document.createElement('li');
+    more.textContent = '… 그리고 ' + (refs.length - 30) + '개 더';
+    list.append(more);
+  }
+  return list;
+}
+
+/** {ref: 글} 또는 {folder: 폴더} 를 받아 지워도 되는지 묻습니다. */
+async function askDrop(target) {
+  const plan = await post('/delete/plan', target);
+  if (!plan) { return false; }
+  const what = plan.kind === 'folder' ? '폴더를' : '글을';
+  const deeper = (plan.pages || []).filter((ref) => ref !== plan.ref);
+  const folders = plan.folders || [];
+
+  const head = document.getElementById('drop-what');
+  head.textContent = '';
+  const name = document.createElement('b');
+  name.textContent = plan.ref;
+  head.append(name, ' ' + what + ' 휴지통으로 보냅니다.');
+
+  const box = document.getElementById('drop-list');
+  box.textContent = '';
+  if (deeper.length || folders.length) {
+    const bits = [];
+    if (deeper.length) { bits.push('아래 딸린 글 ' + deeper.length + '개'); }
+    if (folders.length) { bits.push('하위 폴더 ' + folders.length + '개'); }
+    const line = document.createElement('p');
+    line.className = 'warn';
+    line.textContent = bits.join(', ') + '도 함께 지워집니다.';
+    box.append(line);
+    if (deeper.length) { box.append(dropLines(deeper)); }
+  }
+  dropModal.hidden = false;
+  document.getElementById('drop-no').focus();
+  return new Promise((say) => { dropAnswer = say; });
+}
+
+if (dropModal) {
+  document.getElementById('drop-yes').onclick = () => closeDrop(true);
+  document.getElementById('drop-no').onclick = () => closeDrop(false);
+  dropModal.onclick = (e) => { if (e.target === dropModal) { closeDrop(false); } };
+  document.addEventListener('keydown', (e) => {
+    if (!dropModal.hidden && e.key === 'Escape') { closeDrop(false); }
+  });
+}
+
 async function createFolder(base) {
   const name = prompt('만들 폴더 경로를 넣어 주세요. / 로 여러 단계를 쓸 수 있습니다.',
                       base ? base + '/' : '');
@@ -1418,9 +1651,7 @@ async function renameFolder(folder) {
 }
 
 async function removeFolder(folder) {
-  if (!confirm('‘' + folder + '’ 폴더를 지울까요? 안에 문서가 남아 있으면 지워지지 않습니다.')) {
-    return;
-  }
+  if (!await askDrop({folder: folder})) { return; }
   if (await post('/folder/delete', {folder: folder})) { goFolder(''); }
 }
 
@@ -1431,7 +1662,7 @@ async function renamePage(ref, title) {
 }
 
 async function removePage(ref) {
-  if (!confirm('‘' + ref + '’ 글을 지울까요? 되돌릴 수 없습니다.')) { return; }
+  if (!await askDrop({ref: ref})) { return; }
   if (await post('/delete', {ref: ref})) { location.reload(); }
 }
 
@@ -1677,6 +1908,7 @@ if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide
            value="{html.escape(query, quote=True)}">
     <button class="btn" type="submit">검색</button>
   </form>
+  <a class="btn" href="/trash" title="휴지통 — 지운 글 되살리기">🗑</a>
   <a class="btn" href="/settings" title="위키 이름 바꾸기">⚙</a>
 </header>
 <div class="layout">
@@ -1684,6 +1916,17 @@ if (savedSide) {{ document.documentElement.style.setProperty('--side', savedSide
   <div class="grip" id="grip" title="끌어서 너비 조절"></div>
   <main>{body}</main>
 </div>
+<div class="modal" id="drop-modal" hidden><div class="sheet">
+  <h2>지울까요?</h2>
+  <p id="drop-what"></p>
+  <div id="drop-list"></div>
+  <p class="hint">지운 것은 <b>휴지통</b>으로 갑니다. 오른쪽 위 🗑 에서 되살릴 수 있습니다.</p>
+  <div class="toolbar">
+    <span class="spacer"></span>
+    <button class="btn" id="drop-no">취소</button>
+    <button class="btn primary" id="drop-yes">휴지통으로 보내기</button>
+  </div>
+</div></div>
 <script>{COMMON_SCRIPT}{LAYOUT_SCRIPT}{script}</script>
 </body></html>"""
     return page.encode("utf-8")
@@ -2011,8 +2254,9 @@ readArea.addEventListener('click', (e) => {
 const pageTools = document.getElementById('page-tools');
 if (pageTools) {
   document.getElementById('remove').onclick = async () => {
-    if (!confirm('‘' + pageTools.dataset.ref + '’ 글을 지울까요? 되돌릴 수 없습니다.')) { return; }
-    const removed = await post('/delete', {ref: pageTools.dataset.ref});
+    const ref = pageTools.dataset.ref;
+    if (!await askDrop({ref: ref})) { return; }
+    const removed = await post('/delete', {ref: ref});
     if (removed) { goFolder(removed.folder); }
   };
 }
@@ -3338,6 +3582,77 @@ def edit_body(ref: str, folder: str = "") -> str:
     )
 
 
+def trash_screen() -> str:
+    """휴지통 화면. 지운 것을 되살리거나 완전히 지웁니다."""
+    rows = trash_rows()
+    if not rows:
+        return ("<h1>🗑 휴지통</h1>"
+                '<p class="empty">휴지통이 비어 있습니다.<br>'
+                "글이나 폴더를 지우면 여기로 옮겨지고, 여기서 되살릴 수 있습니다.</p>")
+
+    cards = []
+    for row in rows:
+        ref = row.get("ref", "")
+        pages = row.get("pages") or []
+        folders = row.get("folders") or []
+        when = row.get("at", "").replace("T", " ")
+        what = "폴더" if row.get("kind") == "folder" else "글"
+        deeper = [name for name in pages if name != ref]
+        counts = [f"딸린 글 {len(deeper)}개"] if deeper else []
+        if folders:
+            counts.append(f"하위 폴더 {len(folders)}개")
+        note = f' <span class="meta">({", ".join(counts)} 함께)</span>' if counts else ""
+        listing = (
+            '<details><summary class="meta">함께 지워진 글 보기</summary>'
+            + "<ul>" + "".join(f"<li>{html.escape(name)}</li>" for name in sorted(deeper)) + "</ul>"
+            "</details>"
+        ) if deeper else ""
+        cards.append(
+            f'<li data-id="{html.escape(row["id"], quote=True)}">'
+            '<div class="trash-head">'
+            f"<b>{html.escape(ref)}</b> <span class=\"meta\">{what}</span>{note}"
+            '<span class="spacer"></span>'
+            '<button class="btn" data-act="restore">되살리기</button>'
+            '<button class="btn" data-act="drop">완전히 지우기</button>'
+            "</div>"
+            f'<div class="meta">지운 때: {html.escape(when)}</div>'
+            f"{listing}</li>"
+        )
+    return (
+        "<h1>🗑 휴지통</h1>"
+        '<p class="hint">지운 글과 폴더가 여기 남아 있습니다. 되살리면 원래 자리로 돌아갑니다. '
+        "완전히 지우면 되돌릴 수 없습니다.</p>"
+        '<div class="toolbar"><span id="status" class="meta"></span><span class="spacer"></span>'
+        '<button class="btn" id="trash-empty">휴지통 비우기</button></div>'
+        f'<ul class="trash">{"".join(cards)}</ul>'
+    )
+
+
+TRASH_SCRIPT = """
+const trashStatus = document.getElementById('status');
+
+document.querySelectorAll('.trash [data-act]').forEach((button) => {
+  button.onclick = async () => {
+    const card = button.closest('li');
+    const act = button.dataset.act;
+    if (act === 'drop' && !confirm('‘' + card.querySelector('b').textContent
+        + '’ 를 완전히 지울까요? 되돌릴 수 없습니다.')) { return; }
+    const done = await post('/trash/' + (act === 'drop' ? 'drop' : 'restore'), {id: card.dataset.id});
+    if (!done) { return; }
+    trashStatus.textContent = done.message;
+    card.remove();
+    if (!document.querySelector('.trash li')) { location.reload(); }
+  };
+});
+
+document.getElementById('trash-empty').onclick = async () => {
+  if (!document.querySelector('.trash li')) { return; }
+  if (!confirm('휴지통을 비울까요? 안에 있는 것이 모두 완전히 지워집니다.')) { return; }
+  if (await post('/trash/empty', {})) { location.reload(); }
+};
+"""
+
+
 SETTINGS_SCRIPT = """
 const settingsStatus = document.getElementById('status');
 
@@ -3502,6 +3817,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ))
         elif prefix == "settings":
             self.send(shell(f"설정 - {name}", settings_body(), SETTINGS_SCRIPT, closed=closed, side_sort=side))
+        elif prefix == "trash":
+            self.send(shell(f"휴지통 - {name}", trash_screen(), TRASH_SCRIPT, closed=closed, side_sort=side))
         elif prefix == "tree":
             folder = normalize_ref(query.get("folder", [""])[0])
             rows = sidebar_rows(folder, folder.count("/") + 1, "", "", closed - {folder}, side)
@@ -3533,8 +3850,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.save_page()
         elif prefix == "move":
             self.move_page()
+        elif prefix == "delete" and rest == "plan":
+            self.drop_plan()
         elif prefix == "delete":
             self.remove_page()
+        elif prefix == "trash":
+            self.change_trash(rest)
         elif prefix == "open":
             # 다른 사이트가 몰래 파일을 실행시키지 못하도록 요청이 이 위키에서 왔는지 봅니다.
             origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
@@ -3662,17 +3983,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"ref": new_ref})
 
     def remove_page(self):
+        """글을 아래 딸린 글까지 함께 휴지통으로 보냅니다."""
         ref = normalize_ref(self.read_json().get("ref", ""))
         if not page_exists(ref):
             self.send_text(400, "없는 문서입니다.")
             return
-        under = [name for name, _ in list_pages() if in_folder(name, ref)]
-        if under:
-            self.send_text(400, f"이 글 아래에 글이 {len(under)}개 있습니다. 먼저 옮기거나 지워 주세요.")
+        done, message = to_trash(ref, "page")
+        if not done:
+            self.send_text(400, message)
             return
-        delete_page(ref)
-        drop_comments(ref)
-        self.send_json({"folder": folder_of(ref)})
+        self.send_json({"folder": folder_of(ref), "message": message})
+
+    def drop_plan(self):
+        """지우기 전에 무엇이 함께 지워지는지 알려 줍니다."""
+        data = self.read_json()
+        folder = normalize_ref(data.get("folder", ""))
+        ref = folder or normalize_ref(data.get("ref", ""))
+        if not ref:
+            self.send_text(400, "무엇을 지울지 알 수 없습니다.")
+            return
+        if folder:
+            if not folder_path(folder).is_dir():
+                self.send_text(400, f"‘{folder}’ 폴더가 없습니다.")
+                return
+        elif not page_exists(ref):
+            self.send_text(400, "없는 문서입니다.")
+            return
+        self.send_json({
+            "ref": ref, "kind": "folder" if folder else "page",
+            "pages": pages_under(ref), "folders": folders_under(ref),
+        })
+
+    def change_trash(self, act: str):
+        data = self.read_json() if act != "empty" else {}
+        entry = str(data.get("id", ""))
+        if act == "restore":
+            self.reply(from_trash(entry), "")
+        elif act == "drop":
+            self.reply(drop_trash(entry), "")
+        elif act == "empty":
+            self.reply(empty_trash(), "")
+        else:
+            self.send_text(404, "없는 주소입니다.")
 
     def change_data_dir(self):
         raw = self.read_json().get("path", "").strip()
@@ -3849,7 +4201,10 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
   함께 고쳐집니다.
 - 이미 쓴 글은 문서 화면 오른쪽 위 **글 수정** 으로 고치고, **폴더 이동** 으로 다른 폴더로
   옮기고, **삭제** 로 지웁니다. 편집 화면에서 제목이나 폴더를 바꿔 저장해도 문서가 그대로
-  옮겨집니다. 지운 글은 되돌릴 수 없습니다.
+  옮겨집니다.
+- 지운 글과 폴더는 **휴지통**(오른쪽 위 `🗑`)으로 갑니다. 아래에 딸린 글이 있으면 함께
+  지워지고, 지우기 전에 무엇이 함께 지워지는지 팝업으로 알려 줍니다. 휴지통에서 **되살리기**
+  를 누르면 원래 자리로 돌아옵니다. **완전히 지우기** 는 되돌릴 수 없습니다.
 - 글끼리 연결은 편집 화면의 **글 연결** 단추 하나로 합니다. 이미 있는 글은 목록에서 골라 링크만
   걸고, 목록에 없는 이름을 쓰면 그 글을 새로 만들어 링크를 겁니다. 글자를 골라 두고 누르면 그
   글자에 링크가 걸립니다. 직접 쓰려면 `[[문서 이름]]`, `[[폴더/문서 이름]]`, `[[문서|보일 글자]]`
