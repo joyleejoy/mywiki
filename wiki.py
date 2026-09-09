@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import base64
 import html
 import http.server
 import json
@@ -874,15 +875,17 @@ try:  # 코드에 색을 입히는 데 씁니다. 없으면 색 없이 그대로
     from pygments.formatters import HtmlFormatter
 
     CODE_EXTENSION = ["codehilite"]
+    # 내보낸 파일은 종이에 찍히거나 남에게 건네지므로 늘 밝은 색만 씁니다.
+    CODE_CSS_LIGHT = HtmlFormatter(style="default").get_style_defs(".highlight")
     CODE_CSS = (
-        HtmlFormatter(style="default").get_style_defs(".highlight")
+        CODE_CSS_LIGHT
         + "\n@media (prefers-color-scheme: dark) {\n"
         + HtmlFormatter(style="monokai").get_style_defs(":root:not([data-theme=light]) .highlight")
         + "\n}\n"
     )
 except ImportError:
     CODE_EXTENSION = []
-    CODE_CSS = ""
+    CODE_CSS = CODE_CSS_LIGHT = ""
 
 def build_markdown(highlight: bool) -> markdown.Markdown:
     # extra 에서 각주(footnotes)만 빼고 씁니다. 메모는 각주가 아니라 표시로 답니다.
@@ -958,6 +961,293 @@ def render(text: str, highlight: bool = True) -> str:
         engine.reset()
         # 메모를 먼저 한 줄로 눌러 두어야 loosen() 이 메모 속을 끊지 않습니다.
         return engine.convert(loosen(press_notes(text)))
+
+
+# ---------------------------------------------------------------- 내보내기
+# 글을 위키 밖으로 공유할 때 씁니다. 받는 사람에게 위키가 없어도 열리도록,
+# 스타일과 그림·첨부까지 담은 HTML 한 장으로 만듭니다. 그 화면에서 브라우저
+# 인쇄(Ctrl+P) 로 PDF 를 뽑습니다. 따로 라이브러리를 쓰지 않습니다.
+
+EMBED_LIMIT = 8 * 1024 * 1024   # 한 파일이 이보다 크면 담지 않고 이름만 남깁니다
+
+EXPORT_CSS = """
+:root {
+  --fg: #1f2328; --muted: #656d76; --line: #d8dee4; --card: #f6f8fa;
+  --accent: #0969da; --mark: #fff3c4; --memo: #8a6d00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; padding: 40px 28px 80px; max-width: 820px;
+  background: #ffffff; color: var(--fg);
+  font: 16px/1.75 "Pretendard", "Malgun Gothic", -apple-system, sans-serif;
+  word-break: keep-all; overflow-wrap: break-word;
+}
+h1, h2, h3, h4 { line-height: 1.35; margin: 1.6em 0 .6em; }
+h1 { font-size: 26px; border-bottom: 2px solid var(--line); padding-bottom: 8px; }
+h2 { font-size: 21px; border-bottom: 1px solid var(--line); padding-bottom: 5px; }
+h3 { font-size: 18px; }
+p, ul, ol, blockquote, table, pre { margin: .7em 0; }
+li { margin: .2em 0; }
+a { color: var(--accent); }
+code {
+  font: 13.5px/1.6 "Cascadia Mono", Consolas, monospace;
+  background: var(--card); border-radius: 4px; padding: 1px 5px;
+}
+pre {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto;
+}
+pre code { background: none; padding: 0; }
+blockquote {
+  border-left: 3px solid var(--line); margin-left: 0; padding: 2px 14px; color: var(--muted);
+}
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th, td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; }
+th { background: var(--card); }
+img { max-width: 100%; height: auto; border-radius: 6px; }
+hr { border: none; border-top: 1px solid var(--line); margin: 2em 0; }
+mark { background: var(--mark); }
+
+.doc-head { border-bottom: 3px solid var(--fg); padding-bottom: 14px; margin-bottom: 8px; }
+.doc-head .from { font-size: 13px; color: var(--muted); }
+.doc-head h1 { border: none; margin: 6px 0 4px; padding: 0; font-size: 30px; }
+.toc {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px;
+}
+.toc-title { font-weight: 700; font-size: 14px; margin-bottom: 6px; }
+.toc ul { margin: 0; padding-left: 0; list-style: none; font-size: 14.5px; }
+section { margin-top: 26px; }
+section > h1.title {
+  font-size: 26px; border-bottom: 2px solid var(--fg); padding-bottom: 6px; margin-top: 0;
+}
+section h1:not(.title) { font-size: 22px; }
+.where { font-size: 13px; color: var(--muted); margin: -.3em 0 1em; }
+
+/* 메모는 눌러서 볼 수 없으니 글자 옆에 그대로 펼쳐 둡니다. */
+.note { background: var(--mark); border-bottom: 1.5px solid #d4a72c; border-radius: 2px; }
+.memo {
+  font-size: 13.5px; color: var(--memo); background: #fffbe6;
+  border: 1px solid #ffe58f; border-radius: 4px; padding: 0 6px; margin-left: 4px;
+}
+.memo-line { margin: .2em 0 .9em; }
+.memo-line .memo { margin-left: 0; display: inline-block; padding: 3px 8px; }
+/* 위키 안에서만 통하던 링크는 글자만 남깁니다. */
+.offlink { border-bottom: 1px dotted var(--muted); }
+.path { font: 13.5px "Cascadia Mono", Consolas, monospace; color: var(--muted); }
+.doc-foot {
+  margin-top: 44px; border-top: 1px solid var(--line); padding-top: 10px;
+  font-size: 12.5px; color: var(--muted);
+}
+
+.tools {
+  position: fixed; top: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center;
+  padding: 8px 14px; background: #ffffffee; border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+.tools .btn {
+  border: 1px solid var(--line); background: #fff; color: var(--fg); border-radius: 6px;
+  padding: 5px 12px; font: inherit; cursor: pointer; text-decoration: none;
+}
+.tools .btn.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tools .spacer { flex: 1; }
+body.hastools { padding-top: 72px; }
+
+@media print {
+  @page { margin: 16mm 14mm; }
+  body { padding: 0; max-width: none; font-size: 11.5pt; }
+  body.hastools { padding-top: 0; }
+  .tools { display: none !important; }
+  a { color: #000; }
+  section { break-before: page; page-break-before: always; }
+  section:first-of-type { break-before: auto; page-break-before: auto; }
+  h1, h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
+  pre, table, blockquote, img { break-inside: avoid; page-break-inside: avoid; }
+  tr, li { break-inside: avoid; page-break-inside: avoid; }
+  .toc { break-after: page; page-break-after: always; }
+}
+"""
+
+
+def page_anchor(ref: str) -> str:
+    """파일 안에서 글끼리 서로 가리킬 때 쓰는 이름입니다."""
+    return "doc-" + re.sub(r"[^0-9A-Za-z가-힣]+", "-", ref).strip("-").lower()
+
+
+def export_refs(ref: str, kids: bool) -> list[str]:
+    """내보낼 글 목록. 아래 딸린 글은 왼쪽 목록에 보이는 순서대로 붙입니다."""
+    out = [ref]
+    if not kids:
+        return out
+
+    def walk(parent: str) -> None:
+        for name, is_folder in children_of(parent):
+            path = f"{parent}/{name}" if parent else name
+            if not is_folder and path not in out:
+                out.append(path)
+            walk(path)
+
+    walk(ref)
+    return out
+
+
+def show_notes(body: str) -> str:
+    """눌러서 보는 메모를, 글자 옆에 그대로 펼쳐 둡니다."""
+    def spread(found):
+        note = html.unescape(found.group(1)).strip()
+        shown = "<br>".join(html.escape(line) for line in note.split("\n"))
+        return f'<span class="note">{found.group(2)}</span><span class="memo">{shown}</span>'
+
+    return re.sub(
+        r'<span class="note" data-note="([^"]*)">(.*?)</span>', spread, body, flags=re.S
+    )
+
+
+MEMO_SPAN = re.compile(r'<span class="memo">.*?</span>', re.S)
+HEADING = re.compile(r"<(h[1-6])([^>]*)>(.*?)</\1>", re.S)
+
+
+def lift_memos(body: str) -> str:
+    """제목에 붙은 메모는 제목 줄이 길어지지 않게 바로 아래로 내립니다."""
+    def move(found):
+        tag, attrs, text = found.group(1), found.group(2), found.group(3)
+        memos = MEMO_SPAN.findall(text)
+        if not memos:
+            return found.group(0)
+        return (f"<{tag}{attrs}>{MEMO_SPAN.sub('', text).rstrip()}</{tag}>"
+                + "".join(f'<p class="memo-line">{memo}</p>' for memo in memos))
+
+    return HEADING.sub(move, body)
+
+
+def flatten_links(body: str, included: set[str]) -> str:
+    """위키 안에서만 통하는 링크를 밖에서도 뜻이 통하게 바꿉니다."""
+    def fix(found):
+        attrs, text = found.group(1), found.group(2)
+        spot = re.search(r'data-path="([^"]*)"', attrs)
+        if spot:   # 내 PC 파일은 받는 사람이 열 수 없으므로 경로만 남깁니다
+            where = html.unescape(spot.group(1))
+            line = re.search(r'data-line="(\d+)"', attrs)
+            tail = ":" + line.group(1) if line else ""
+            return f'<span class="path">{html.escape(where)}{tail}</span>'
+        href = re.search(r'href="([^"]*)"', attrs)
+        target = html.unescape(href.group(1)) if href else ""
+        if not target.startswith(("/w/", "/e/")):
+            return found.group(0)
+        other = urllib.parse.unquote(target[3:])
+        if other in included:
+            return f'<a href="#{page_anchor(other)}">{text}</a>'
+        return f'<span class="offlink" title="위키 문서: {html.escape(other, quote=True)}">{text}</span>'
+
+    return re.sub(r"<a\s([^>]*)>(.*?)</a>", fix, body, flags=re.S)
+
+
+def embed_files(body: str) -> str:
+    """그림과 첨부를 파일 안에 담아, 위키 없이도 보이게 합니다."""
+    kept: dict[str, str | None] = {}
+
+    def as_data(name: str) -> str | None:
+        if name not in kept:
+            target = (FILES / Path(name).name).resolve()
+            if (not target.is_file() or FILES.resolve() not in target.parents
+                    or target.stat().st_size > EMBED_LIMIT):
+                kept[name] = None
+            else:
+                kind = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                kept[name] = (f"data:{kind};base64,"
+                              + base64.b64encode(target.read_bytes()).decode())
+        return kept[name]
+
+    def named(raw: str) -> str:
+        return urllib.parse.unquote(raw.split("?")[0])
+
+    def fix_img(found):
+        uri = as_data(named(found.group(1)))
+        return f'src="{uri}"' if uri else found.group(0)
+
+    def fix_link(found):
+        name = named(found.group(1))
+        uri = as_data(name)
+        if not uri:
+            return f'<span class="path">{html.escape(name)}</span>'
+        return (f'<a href="{uri}" download="{html.escape(name, quote=True)}"'
+                f"{found.group(2)}>{found.group(3)}</a>")
+
+    body = re.sub(r'src="/f/([^"]+)"', fix_img, body)
+    return re.sub(r'<a href="/f/([^"]+)"([^>]*)>(.*?)</a>', fix_link, body, flags=re.S)
+
+
+def export_toc(ref: str, refs: list[str]) -> str:
+    """딸린 글까지 내보낼 때 맨 앞에 놓는 차례입니다."""
+    if len(refs) < 2:
+        return ""
+    rows = []
+    base = ref.count("/")
+    for one in refs:
+        depth = max(0, one.count("/") - base)
+        rows.append(
+            f'<li style="margin-left:{depth * 16}px">'
+            f'<a href="#{page_anchor(one)}">{html.escape(title_of(one))}</a></li>'
+        )
+    return ('<div class="toc"><div class="toc-title">차례</div><ul>'
+            + "".join(rows) + "</ul></div>")
+
+
+def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False) -> str:
+    """글(과 아래 딸린 글)을 혼자서 열리는 HTML 한 장으로 만듭니다."""
+    refs = [one for one in export_refs(ref, kids) if page_exists(one)]
+    included = set(refs)
+    solo = len(refs) == 1   # 글이 하나뿐이면 맨 위 제목만으로 충분합니다
+    parts = []
+    for one in refs:
+        body = render(read_page(one))
+        body = lift_memos(show_notes(body))
+        body = flatten_links(body, included)
+        if embed:
+            body = embed_files(body)
+        when = datetime.fromtimestamp(page_path(one).stat().st_mtime)
+        where = folder_of(one)
+        head = "" if solo else (
+            f'<h1 class="title">{html.escape(title_of(one))}</h1>'
+            f'<p class="where">{html.escape(where) + " · " if where else ""}'
+            f"마지막 수정 {when:%Y-%m-%d}</p>"
+        )
+        parts.append(f'<section id="{page_anchor(one)}">{head}{body}</section>')
+
+    quoted = urllib.parse.quote(ref)
+    bar = (
+        '<div class="tools">'
+        '<button class="btn go" onclick="print()">🖨 PDF 로 저장 (인쇄)</button>'
+        f'<a class="btn" href="/export/{quoted}?kids={1 if kids else 0}">💾 HTML 파일로 저장</a>'
+        '<span class="spacer"></span>'
+        f'<a class="btn" href="/w/{quoted}">← 위키로 돌아가기</a>'
+        "</div>"
+    ) if tools else ""
+    count = f" · 글 {len(refs)}개" if len(refs) > 1 else ""
+    changed = datetime.fromtimestamp(page_path(ref).stat().st_mtime)
+    return f"""<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title_of(ref))}</title>
+<style>{EXPORT_CSS}{CODE_CSS_LIGHT}</style>
+</head><body{' class="hastools"' if tools else ""}>
+{bar}
+<div class="doc-head">
+  <div class="from">{html.escape(wiki_name())}{count}</div>
+  <h1>{html.escape(title_of(ref))}</h1>
+  <div class="from">{html.escape(folder_of(ref) or "맨 바깥")} · 마지막 수정 {changed:%Y-%m-%d} · 내보낸 날 {datetime.now():%Y-%m-%d}</div>
+</div>
+{export_toc(ref, refs)}
+{"".join(parts)}
+<p class="doc-foot">{html.escape(wiki_name())} 에서 내보냈습니다 · {datetime.now():%Y-%m-%d %H:%M}</p>
+</body></html>
+"""
+
+
+def export_name(ref: str, kids: bool) -> str:
+    """내려받을 파일 이름입니다."""
+    stem = INVALID_CHARS.sub("_", title_of(ref)) or "문서"
+    tail = "-모음" if kids else ""
+    return f"{stem}{tail}-{datetime.now():%Y%m%d}.html"
 
 
 class MarkdownWriter(HTMLParser):
@@ -1447,6 +1737,23 @@ ul.drop-list {
 }
 #note-card .drop-note:hover { color: var(--new); }
 .toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
+
+/* 위키 화면을 그대로 인쇄할 때 (Ctrl+P). 제대로 내보내려면 글 화면의 내보내기를 쓰세요. */
+@media print {
+  @page { margin: 16mm 14mm; }
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #57606a; --line: #d0d7de;
+    --card: #f6f8fa; --code-bg: #f6f8fa; --accent: #0a53be; --new: #57606a; --mark: #fff3c4;
+  }
+  header, aside, .grip, #page-tools, .mdbar, .tabs, #note-bubble, #note-card,
+  #comments textarea, #comments .toolbar, .comments .comment-head .btn, .modal,
+  details.hint { display: none !important; }
+  main { max-width: none; margin: 0; padding: 0; }
+  a { color: var(--fg); }
+  h1, h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
+  pre, table, blockquote, img, tr, li { break-inside: avoid; page-break-inside: avoid; }
+  .note::after { content: ""; }
+}
 .toolbar .spacer { flex: 1; }
 .hint { color: var(--muted); font-size: 13px; }
 input[type=text], input[type=search], select {
@@ -2086,6 +2393,7 @@ def view_body(ref: str) -> str:
         f'<span class="spacer"></span>'
         f'<a class="btn primary" href="/e/{quoted}">글 수정</a>'
         f'<a class="btn" href="/new?folder={quoted}">아래에 새 글</a>'
+        f'<button class="btn" id="share">내보내기</button>'
         f'<button class="btn danger" id="remove">삭제</button></div>'
         f"<h1>{html.escape(title_of(ref))}</h1>{render(read_page(ref))}"
         f"{children_list(ref)}"
@@ -2093,6 +2401,31 @@ def view_body(ref: str) -> str:
         f'<button class="btn primary" id="note-bubble" '
         f'data-ref="{html.escape(ref, quote=True)}" hidden>📝 메모 붙이기</button>'
         '<div id="note-card" hidden></div>'
+        + share_modal(ref)
+    )
+
+
+def share_modal(ref: str) -> str:
+    """내보내기 팝업. 무엇을 어떤 모양으로 내보낼지 고릅니다."""
+    kids = len(export_refs(ref, True)) - 1
+    under = (
+        '<p><label><input type="radio" name="share-what" value="1"> '
+        f'이 글과 <b>아래 딸린 글 {kids}개</b> (차례가 앞에 붙습니다)</label></p>'
+    ) if kids else ""
+    return (
+        '<div class="modal" id="share-modal" hidden><div class="sheet">'
+        "<h2>내보내기</h2>"
+        '<p class="hint">위키가 없는 사람도 열 수 있는 <b>HTML 한 장</b>으로 만듭니다. '
+        "그림과 첨부도 파일 안에 담기고, 메모는 글자 옆에 펼쳐 둡니다.<br>"
+        "<b>PDF</b> 는 열린 화면에서 인쇄(<code>Ctrl+P</code>) → <b>대상: PDF로 저장</b> 을 고르면 됩니다. "
+        "댓글은 넣지 않습니다.</p>"
+        '<p><label><input type="radio" name="share-what" value="0" checked> 이 글만</label></p>'
+        f"{under}"
+        '<div class="toolbar"><span class="spacer"></span>'
+        '<button class="btn" id="share-cancel">취소</button>'
+        '<a class="btn" id="share-file">💾 HTML 파일로 저장</a>'
+        '<a class="btn primary" id="share-print" target="_blank">🖨 PDF 로 저장 (인쇄 화면)</a>'
+        "</div></div></div>"
     )
 
 
@@ -2253,6 +2586,29 @@ readArea.addEventListener('click', (e) => {
 
 const pageTools = document.getElementById('page-tools');
 if (pageTools) {
+  // 내보내기: 무엇을 낼지 고르고 읽기용 화면이나 파일로 보냅니다.
+  const shareModal = document.getElementById('share-modal');
+  const shareRef = encodeURIComponent(pageTools.dataset.ref);
+
+  function shareSync() {
+    const picked = document.querySelector('input[name="share-what"]:checked');
+    const kids = picked && picked.value === '1' ? 1 : 0;
+    document.getElementById('share-print').href = '/read/' + shareRef + '?kids=' + kids;
+    document.getElementById('share-file').href = '/export/' + shareRef + '?kids=' + kids;
+  }
+
+  document.getElementById('share').onclick = () => { shareSync(); shareModal.hidden = false; };
+  document.getElementById('share-cancel').onclick = () => { shareModal.hidden = true; };
+  shareModal.onclick = (e) => { if (e.target === shareModal) { shareModal.hidden = true; } };
+  shareModal.querySelectorAll('input[name="share-what"]').forEach((one) => {
+    one.onchange = shareSync;
+  });
+  document.addEventListener('keydown', (e) => {
+    if (!shareModal.hidden && e.key === 'Escape') { shareModal.hidden = true; }
+  });
+  document.getElementById('share-file').onclick = () => { shareModal.hidden = true; };
+  document.getElementById('share-print').onclick = () => { shareModal.hidden = true; };
+
   document.getElementById('remove').onclick = async () => {
     const ref = pageTools.dataset.ref;
     if (!await askDrop({ref: ref})) { return; }
@@ -3735,10 +4091,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
 
-    def send(self, body: bytes, status: int = 200, content_type: str = "text/html; charset=utf-8"):
+    def send(self, body: bytes, status: int = 200, content_type: str = "text/html; charset=utf-8",
+             filename: str = ""):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if filename:   # 한글 파일 이름은 RFC 5987 방식으로 적어 줍니다
+            quoted = urllib.parse.quote(filename)
+            self.send_header("Content-Disposition",
+                             f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}")
         # 글을 고치거나 옮긴 뒤 옛 화면이 다시 나오지 않도록 캐시를 쓰지 않습니다.
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -3838,6 +4199,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     f"{title_of(ref)} 편집", edit_body(ref), EDITOR_SCRIPT,
                     current_ref=ref, closed=closed, side_sort=side, body_class="editing",
                 ))
+        elif prefix in ("read", "export"):
+            ref = resolve_ref(normalize_ref(rest))
+            kids = query.get("kids", ["0"])[0] not in ("0", "", "false")
+            if not is_valid_ref(ref) or not page_exists(ref):
+                self.send_text(404, "없는 문서입니다.")
+            elif prefix == "read":
+                # 화면에서 바로 인쇄(PDF)할 수 있게, 첨부는 주소로 두고 가볍게 보여 줍니다.
+                self.send(export_doc(ref, kids, embed=False, tools=True).encode("utf-8"))
+            else:
+                self.send(export_doc(ref, kids, embed=True).encode("utf-8"),
+                          filename=export_name(ref, kids))
         elif prefix == "f":
             self.serve_file(rest)
         else:
@@ -4225,6 +4597,9 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
   `files/` 폴더에 저장되고 본문에 링크가 삽입됩니다.
 - **그림** 단추로 자유선·직선·사각형·타원·화살표를 그려 넣을 수 있습니다. 그림은 SVG 한 장으로
   저장되고, 서식 편집 모드에서 그림을 두 번 누르면 다시 열어 고칠 수 있습니다.
+- 글 화면의 **내보내기** 로 밖에 공유합니다. 위키가 없는 사람도 열 수 있는 HTML 한 장으로
+  만들고(그림·첨부까지 담김), 그 화면에서 인쇄(`Ctrl+P`) → **대상: PDF로 저장** 으로 PDF 를
+  뽑습니다. **이 글과 아래 딸린 글** 을 고르면 차례가 붙은 한 권으로 묶입니다.
 - 오른쪽 위 검색창에서 제목과 본문을 함께 찾습니다.
 - 위키 이름과 **데이터 폴더**는 오른쪽 위 ⚙ 에서 바꿉니다. 데이터 폴더를 OneDrive 같은
   동기화 폴더로 지정하면 다른 기기에서도 같은 내용을 보고 고칠 수 있습니다.
