@@ -1051,9 +1051,12 @@ section h1:not(.title) { font-size: 1.35em; }
   padding: 5px 12px; font: inherit; cursor: pointer; text-decoration: none;
 }
 .tools .btn.go { background: var(--accent); border-color: var(--accent); color: #fff; }
-.tools .btn.size { padding: 4px 9px; font-size: 13px; }
-.tools .btn.size.on { border-color: var(--accent); color: var(--accent); font-weight: 700; }
-.tools .sizes { display: flex; gap: 4px; align-items: center; font-size: 13px; color: var(--muted); }
+.tools .btn.tiny { padding: 3px 8px; font-size: 12px; color: var(--muted); }
+.tools .sizes { display: flex; gap: 7px; align-items: center; font-size: 13px; color: var(--muted); }
+.tools .sizes input[type=range] { width: 130px; accent-color: var(--accent); cursor: ew-resize; }
+.tools #size-now {
+  min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg);
+}
 .tools .spacer { flex: 1; }
 body.hastools { padding-top: 72px; }
 
@@ -1198,7 +1201,16 @@ def export_toc(ref: str, refs: list[str]) -> str:
             + "".join(rows) + "</ul></div>")
 
 
-SCALES = {"작게": 0.85, "보통": 1.0, "크게": 1.2}
+PRINT_PT = 9.5           # 종이에 찍히는 기본 글자 크기 (배율 1.0 일 때)
+SCALE_LOW, SCALE_HIGH = 0.6, 1.6
+
+
+def clamp_scale(raw) -> float:
+    """글자 배율은 이 사이에서만 받습니다."""
+    try:
+        return min(SCALE_HIGH, max(SCALE_LOW, float(raw)))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False,
@@ -1224,37 +1236,39 @@ def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False,
         parts.append(f'<section id="{page_anchor(one)}">{head}{body}</section>')
 
     quoted = urllib.parse.quote(ref)
-    steps = "".join(
-        f'<button class="btn size" data-scale="{value}">{name}</button>'
-        for name, value in SCALES.items()
-    )
     bar = (
         '<div class="tools">'
         '<button class="btn go" onclick="print()">🖨 PDF 로 저장 (인쇄)</button>'
         f'<a class="btn" id="save-file" href="/export/{quoted}?kids={1 if kids else 0}">'
         "💾 HTML 파일로 저장</a>"
-        f'<span class="sizes">글자 {steps}</span>'
+        '<span class="sizes"><label for="size-bar">글자</label>'
+        f'<input type="range" id="size-bar" min="{SCALE_LOW}" max="{SCALE_HIGH}" '
+        f'step="0.01" value="{scale}" title="끌어서 글자 크기를 맞춥니다">'
+        '<span id="size-now" title="종이에 찍히는 글자 크기"></span>'
+        '<button class="btn tiny" id="size-reset" title="기본 크기로">되돌리기</button></span>'
         '<span class="spacer"></span>'
         f'<a class="btn" href="/w/{quoted}">← 위키로 돌아가기</a>'
         "</div>"
         "<script>"
         "const saveFile = document.getElementById('save-file');"
         "const base = saveFile.getAttribute('href');"
-        "function setScale(value) {"
-        "  document.documentElement.style.setProperty('--scale', value);"
-        "  saveFile.href = base + '&size=' + value;"
-        "  for (const one of document.querySelectorAll('.btn.size')) {"
-        "    one.classList.toggle('on', one.dataset.scale === String(value));"
-        "  }"
-        "  try { localStorage.setItem('readScale', value); } catch (e) {}"
+        "const sizeBar = document.getElementById('size-bar');"
+        "const sizeNow = document.getElementById('size-now');"
+        "function setScale(raw) {"
+        f"  const value = Math.min({SCALE_HIGH}, Math.max({SCALE_LOW}, Number(raw) || 1));"
+        "  const shown = value.toFixed(2);"
+        "  document.documentElement.style.setProperty('--scale', shown);"
+        "  sizeBar.value = shown;"
+        f"  sizeNow.textContent = ({PRINT_PT} * value).toFixed(1) + 'pt';"
+        "  saveFile.href = base + '&size=' + shown;"
+        "  try { localStorage.setItem('readScale', shown); } catch (e) {}"
         "}"
-        "for (const one of document.querySelectorAll('.btn.size')) {"
-        "  one.onclick = () => setScale(one.dataset.scale);"
-        "}"
+        "sizeBar.oninput = () => setScale(sizeBar.value);"
+        "document.getElementById('size-reset').onclick = () => setScale(1);"
         "let saved = null;"
         "try { saved = localStorage.getItem('readScale'); } catch (e) {}"
         "const asked = new URLSearchParams(location.search).get('size');"
-        f"setScale(asked || saved || '{scale}');"
+        f"setScale(asked || saved || {scale});"
         "</script>"
     ) if tools else ""
     count = f" · 글 {len(refs)}개" if len(refs) > 1 else ""
@@ -4239,10 +4253,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif prefix in ("read", "export"):
             ref = resolve_ref(normalize_ref(rest))
             kids = query.get("kids", ["0"])[0] not in ("0", "", "false")
-            try:   # 글자 크기는 0.6~1.6 배 안에서만 받습니다
-                scale = min(1.6, max(0.6, float(query.get("size", ["1"])[0])))
-            except ValueError:
-                scale = 1.0
+            scale = clamp_scale(query.get("size", ["1"])[0])
             if not is_valid_ref(ref) or not page_exists(ref):
                 self.send_text(404, "없는 문서입니다.")
             elif prefix == "read":
@@ -4642,7 +4653,7 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
 - 글 화면의 **내보내기** 로 밖에 공유합니다. 위키가 없는 사람도 열 수 있는 HTML 한 장으로
   만들고(그림·첨부까지 담김), 그 화면에서 인쇄(`Ctrl+P`) → **대상: PDF로 저장** 으로 PDF 를
   뽑습니다. **이 글과 아래 딸린 글** 을 고르면 차례가 붙은 한 권으로 묶입니다. 읽기용 화면
-  위 막대의 **글자 작게·보통·크게** 로 쪽 수를 조절합니다.
+  위 막대의 **글자 슬라이더**를 끌어 쪽 수를 조절합니다.
 - 오른쪽 위 검색창에서 제목과 본문을 함께 찾습니다.
 - 위키 이름과 **데이터 폴더**는 오른쪽 위 ⚙ 에서 바꿉니다. 데이터 폴더를 OneDrive 같은
   동기화 폴더로 지정하면 다른 기기에서도 같은 내용을 보고 고칠 수 있습니다.
