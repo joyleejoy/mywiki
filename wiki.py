@@ -976,67 +976,69 @@ EXPORT_CSS = """
   --accent: #0969da; --mark: #fff3c4; --memo: #8a6d00;
 }
 * { box-sizing: border-box; }
+/* 글자 크기는 이 하나로 조절합니다. 나머지는 모두 여기에 비례합니다. */
+:root { --scale: 1; }
 body {
   margin: 0 auto; padding: 40px 28px 80px; max-width: 820px;
   background: #ffffff; color: var(--fg);
-  font: 16px/1.75 "Pretendard", "Malgun Gothic", -apple-system, sans-serif;
+  font: calc(15px * var(--scale))/1.7 "Pretendard", "Malgun Gothic", -apple-system, sans-serif;
   word-break: keep-all; overflow-wrap: break-word;
 }
-h1, h2, h3, h4 { line-height: 1.35; margin: 1.6em 0 .6em; }
-h1 { font-size: 26px; border-bottom: 2px solid var(--line); padding-bottom: 8px; }
-h2 { font-size: 21px; border-bottom: 1px solid var(--line); padding-bottom: 5px; }
-h3 { font-size: 18px; }
-p, ul, ol, blockquote, table, pre { margin: .7em 0; }
-li { margin: .2em 0; }
+h1, h2, h3, h4 { line-height: 1.35; margin: 1.4em 0 .5em; }
+h1 { font-size: 1.6em; border-bottom: 2px solid var(--line); padding-bottom: 6px; }
+h2 { font-size: 1.3em; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+h3 { font-size: 1.13em; }
+p, ul, ol, blockquote, table, pre { margin: .6em 0; }
+li { margin: .15em 0; }
 a { color: var(--accent); }
 code {
-  font: 13.5px/1.6 "Cascadia Mono", Consolas, monospace;
-  background: var(--card); border-radius: 4px; padding: 1px 5px;
+  font: .88em/1.55 "Cascadia Mono", Consolas, monospace;
+  background: var(--card); border-radius: 4px; padding: 1px 4px;
 }
 pre {
   background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-  padding: 12px 14px; overflow-x: auto;
+  padding: 10px 12px; overflow-x: auto;
 }
 pre code { background: none; padding: 0; }
 blockquote {
   border-left: 3px solid var(--line); margin-left: 0; padding: 2px 14px; color: var(--muted);
 }
-table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
-th, td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; }
+table { border-collapse: collapse; width: 100%; font-size: .93em; }
+th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: top; }
 th { background: var(--card); }
 img { max-width: 100%; height: auto; border-radius: 6px; }
 hr { border: none; border-top: 1px solid var(--line); margin: 2em 0; }
 mark { background: var(--mark); }
 
 .doc-head { border-bottom: 3px solid var(--fg); padding-bottom: 14px; margin-bottom: 8px; }
-.doc-head .from { font-size: 13px; color: var(--muted); }
-.doc-head h1 { border: none; margin: 6px 0 4px; padding: 0; font-size: 30px; }
+.doc-head .from { font-size: .84em; color: var(--muted); }
+.doc-head h1 { border: none; margin: 6px 0 4px; padding: 0; font-size: 1.95em; }
 .toc {
   background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px;
 }
-.toc-title { font-weight: 700; font-size: 14px; margin-bottom: 6px; }
-.toc ul { margin: 0; padding-left: 0; list-style: none; font-size: 14.5px; }
+.toc-title { font-weight: 700; font-size: .92em; margin-bottom: 6px; }
+.toc ul { margin: 0; padding-left: 0; list-style: none; font-size: .95em; }
 section { margin-top: 26px; }
 section > h1.title {
-  font-size: 26px; border-bottom: 2px solid var(--fg); padding-bottom: 6px; margin-top: 0;
+  font-size: 1.6em; border-bottom: 2px solid var(--fg); padding-bottom: 6px; margin-top: 0;
 }
-section h1:not(.title) { font-size: 22px; }
-.where { font-size: 13px; color: var(--muted); margin: -.3em 0 1em; }
+section h1:not(.title) { font-size: 1.35em; }
+.where { font-size: .84em; color: var(--muted); margin: -.3em 0 .9em; }
 
 /* 메모는 눌러서 볼 수 없으니 글자 옆에 그대로 펼쳐 둡니다. */
 .note { background: var(--mark); border-bottom: 1.5px solid #d4a72c; border-radius: 2px; }
 .memo {
-  font-size: 13.5px; color: var(--memo); background: #fffbe6;
+  font-size: .88em; color: var(--memo); background: #fffbe6;
   border: 1px solid #ffe58f; border-radius: 4px; padding: 0 6px; margin-left: 4px;
 }
 .memo-line { margin: .2em 0 .9em; }
 .memo-line .memo { margin-left: 0; display: inline-block; padding: 3px 8px; }
 /* 위키 안에서만 통하던 링크는 글자만 남깁니다. */
 .offlink { border-bottom: 1px dotted var(--muted); }
-.path { font: 13.5px "Cascadia Mono", Consolas, monospace; color: var(--muted); }
+.path { font: .88em "Cascadia Mono", Consolas, monospace; color: var(--muted); }
 .doc-foot {
   margin-top: 44px; border-top: 1px solid var(--line); padding-top: 10px;
-  font-size: 12.5px; color: var(--muted);
+  font-size: .8em; color: var(--muted);
 }
 
 .tools {
@@ -1049,12 +1051,16 @@ section h1:not(.title) { font-size: 22px; }
   padding: 5px 12px; font: inherit; cursor: pointer; text-decoration: none;
 }
 .tools .btn.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tools .btn.size { padding: 4px 9px; font-size: 13px; }
+.tools .btn.size.on { border-color: var(--accent); color: var(--accent); font-weight: 700; }
+.tools .sizes { display: flex; gap: 4px; align-items: center; font-size: 13px; color: var(--muted); }
 .tools .spacer { flex: 1; }
 body.hastools { padding-top: 72px; }
 
 @media print {
-  @page { margin: 16mm 14mm; }
-  body { padding: 0; max-width: none; font-size: 11.5pt; }
+  @page { margin: 14mm 13mm; }
+  /* 종이에서는 화면보다 작게 잡아야 쪽 수가 확 줄어듭니다. 위 막대에서 조절합니다. */
+  body { padding: 0; max-width: none; font-size: calc(9.5pt * var(--scale)); line-height: 1.5; }
   body.hastools { padding-top: 0; }
   .tools { display: none !important; }
   a { color: #000; }
@@ -1192,7 +1198,11 @@ def export_toc(ref: str, refs: list[str]) -> str:
             + "".join(rows) + "</ul></div>")
 
 
-def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False) -> str:
+SCALES = {"작게": 0.85, "보통": 1.0, "크게": 1.2}
+
+
+def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False,
+               scale: float = 1.0) -> str:
     """글(과 아래 딸린 글)을 혼자서 열리는 HTML 한 장으로 만듭니다."""
     refs = [one for one in export_refs(ref, kids) if page_exists(one)]
     included = set(refs)
@@ -1214,13 +1224,38 @@ def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False) -> str:
         parts.append(f'<section id="{page_anchor(one)}">{head}{body}</section>')
 
     quoted = urllib.parse.quote(ref)
+    steps = "".join(
+        f'<button class="btn size" data-scale="{value}">{name}</button>'
+        for name, value in SCALES.items()
+    )
     bar = (
         '<div class="tools">'
         '<button class="btn go" onclick="print()">🖨 PDF 로 저장 (인쇄)</button>'
-        f'<a class="btn" href="/export/{quoted}?kids={1 if kids else 0}">💾 HTML 파일로 저장</a>'
+        f'<a class="btn" id="save-file" href="/export/{quoted}?kids={1 if kids else 0}">'
+        "💾 HTML 파일로 저장</a>"
+        f'<span class="sizes">글자 {steps}</span>'
         '<span class="spacer"></span>'
         f'<a class="btn" href="/w/{quoted}">← 위키로 돌아가기</a>'
         "</div>"
+        "<script>"
+        "const saveFile = document.getElementById('save-file');"
+        "const base = saveFile.getAttribute('href');"
+        "function setScale(value) {"
+        "  document.documentElement.style.setProperty('--scale', value);"
+        "  saveFile.href = base + '&size=' + value;"
+        "  for (const one of document.querySelectorAll('.btn.size')) {"
+        "    one.classList.toggle('on', one.dataset.scale === String(value));"
+        "  }"
+        "  try { localStorage.setItem('readScale', value); } catch (e) {}"
+        "}"
+        "for (const one of document.querySelectorAll('.btn.size')) {"
+        "  one.onclick = () => setScale(one.dataset.scale);"
+        "}"
+        "let saved = null;"
+        "try { saved = localStorage.getItem('readScale'); } catch (e) {}"
+        "const asked = new URLSearchParams(location.search).get('size');"
+        f"setScale(asked || saved || '{scale}');"
+        "</script>"
     ) if tools else ""
     count = f" · 글 {len(refs)}개" if len(refs) > 1 else ""
     changed = datetime.fromtimestamp(page_path(ref).stat().st_mtime)
@@ -1228,7 +1263,8 @@ def export_doc(ref: str, kids: bool, embed: bool, tools: bool = False) -> str:
 <html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title_of(ref))}</title>
-<style>{EXPORT_CSS}{CODE_CSS_LIGHT}</style>
+<style>{EXPORT_CSS}{CODE_CSS_LIGHT}
+:root {{ --scale: {scale}; }}</style>
 </head><body{' class="hastools"' if tools else ""}>
 {bar}
 <div class="doc-head">
@@ -1748,6 +1784,7 @@ ul.drop-list {
   header, aside, .grip, #page-tools, .mdbar, .tabs, #note-bubble, #note-card,
   #comments textarea, #comments .toolbar, .comments .comment-head .btn, .modal,
   details.hint { display: none !important; }
+  body { font: 10pt/1.55 "Pretendard", "Malgun Gothic", -apple-system, sans-serif; }
   main { max-width: none; margin: 0; padding: 0; }
   a { color: var(--fg); }
   h1, h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
@@ -4202,13 +4239,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif prefix in ("read", "export"):
             ref = resolve_ref(normalize_ref(rest))
             kids = query.get("kids", ["0"])[0] not in ("0", "", "false")
+            try:   # 글자 크기는 0.6~1.6 배 안에서만 받습니다
+                scale = min(1.6, max(0.6, float(query.get("size", ["1"])[0])))
+            except ValueError:
+                scale = 1.0
             if not is_valid_ref(ref) or not page_exists(ref):
                 self.send_text(404, "없는 문서입니다.")
             elif prefix == "read":
                 # 화면에서 바로 인쇄(PDF)할 수 있게, 첨부는 주소로 두고 가볍게 보여 줍니다.
-                self.send(export_doc(ref, kids, embed=False, tools=True).encode("utf-8"))
+                self.send(export_doc(ref, kids, embed=False, tools=True,
+                                     scale=scale).encode("utf-8"))
             else:
-                self.send(export_doc(ref, kids, embed=True).encode("utf-8"),
+                self.send(export_doc(ref, kids, embed=True, scale=scale).encode("utf-8"),
                           filename=export_name(ref, kids))
         elif prefix == "f":
             self.serve_file(rest)
@@ -4599,7 +4641,8 @@ WELCOME = """로컬 위키에 오신 것을 환영합니다. 이 문서도 편�
   저장되고, 서식 편집 모드에서 그림을 두 번 누르면 다시 열어 고칠 수 있습니다.
 - 글 화면의 **내보내기** 로 밖에 공유합니다. 위키가 없는 사람도 열 수 있는 HTML 한 장으로
   만들고(그림·첨부까지 담김), 그 화면에서 인쇄(`Ctrl+P`) → **대상: PDF로 저장** 으로 PDF 를
-  뽑습니다. **이 글과 아래 딸린 글** 을 고르면 차례가 붙은 한 권으로 묶입니다.
+  뽑습니다. **이 글과 아래 딸린 글** 을 고르면 차례가 붙은 한 권으로 묶입니다. 읽기용 화면
+  위 막대의 **글자 작게·보통·크게** 로 쪽 수를 조절합니다.
 - 오른쪽 위 검색창에서 제목과 본문을 함께 찾습니다.
 - 위키 이름과 **데이터 폴더**는 오른쪽 위 ⚙ 에서 바꿉니다. 데이터 폴더를 OneDrive 같은
   동기화 폴더로 지정하면 다른 기기에서도 같은 내용을 보고 고칠 수 있습니다.
