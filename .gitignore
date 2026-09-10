@@ -3,6 +3,7 @@ pages/
 files/
 config.json
 comments.json
+trash/
 
 # 파이썬
 __pycache__/
